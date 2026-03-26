@@ -175,16 +175,39 @@ def send_error(context: str, exc: Optional[Exception] = None) -> None:
     _send(text)
 
 
-def send_health(loop_count: int, uptime_seconds: float) -> None:
+def send_health(
+    loop_count: int,
+    uptime_seconds: float,
+    price: Optional[float] = None,
+    vwap: Optional[float] = None,
+    rsi: Optional[float] = None,
+) -> None:
     """
     Periodic heartbeat message so you know the bot is still running.
     Sent roughly every hour (every HEALTH_LOG_INTERVAL loops).
+    Includes latest price, VWAP, and RSI if available.
     """
     hours = uptime_seconds / 3600
+
+    # Market snapshot line (shown when values are available)
+    if price is not None and vwap is not None and rsi is not None:
+        gap_pct = ((price - vwap) / vwap) * 100
+        gap_str = f"{gap_pct:+.2f}%"
+        rsi_zone = "✅ in zone" if 40 <= rsi <= 60 else "⏳ outside"
+        market_lines = (
+            f"\n📊 <b>Market Snapshot</b>\n"
+            f"Price  : <code>${price:,.2f}</code>\n"
+            f"VWAP   : <code>${vwap:,.2f}</code>  (<code>{gap_str}</code>)\n"
+            f"RSI(14): <code>{rsi:.1f}</code>  {rsi_zone} [40–60]"
+        )
+    else:
+        market_lines = ""
+
     text = (
         f"💓 <b>Bot Heartbeat</b>  {_mode_tag()}\n\n"
         f"Symbol : <code>{_escape(config.SYMBOL)}</code>\n"
         f"Loops  : <code>{loop_count}</code>\n"
         f"Uptime : <code>{hours:.1f}h</code>"
+        f"{market_lines}"
     )
     _send(text)

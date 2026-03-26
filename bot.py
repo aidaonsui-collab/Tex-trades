@@ -357,8 +357,8 @@ def handle_exit(result: strategy.SignalResult, state: PositionState) -> None:
 # Main loop
 # ─────────────────────────────────────────────
 
-def run_loop(state: PositionState) -> None:
-    """Execute a single strategy iteration."""
+def run_loop(state: PositionState):
+    """Execute a single strategy iteration. Returns the strategy result for heartbeat tracking."""
     try:
         candles = exchange.get_candles(
             config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK
@@ -366,14 +366,14 @@ def run_loop(state: PositionState) -> None:
     except Exception as exc:
         logger.error("Failed to fetch candles: %s", exc)
         telegram.send_error("get_candles failed", exc)
-        return
+        return None
 
     try:
         result = strategy.compute_signal(candles)
     except Exception as exc:
         logger.error("Strategy computation error: %s", exc)
         telegram.send_error("compute_signal failed", exc)
-        return
+        return None
 
     logger.info(
         "Signal=%s  price=$%.2f  vwap=$%.2f  rsi=%.2f  position=%s",
@@ -393,6 +393,8 @@ def run_loop(state: PositionState) -> None:
             handle_entry(result, state)
         else:
             logger.debug("Flat — no entry signal this candle")
+
+    return result
 
 
 def main() -> None:
@@ -428,18 +430,27 @@ def main() -> None:
 
     start_time = time.time()
     loop_count = 0
+    _last_result = None  # track latest market snapshot for heartbeat
 
     while not _shutdown_requested:
         loop_start = time.time()
         loop_count += 1
         logger.info("─── Loop %d ───", loop_count)
 
-        run_loop(state)
+        result = run_loop(state)
+        if result is not None:
+            _last_result = result
 
-        # Periodic health heartbeat
+        # Periodic health heartbeat — include market snapshot if available
         if loop_count % config.HEALTH_LOG_INTERVAL == 0:
             uptime = time.time() - start_time
-            telegram.send_health(loop_count, uptime)
+            if _last_result is not None:
+                telegram.send_health(loop_count, uptime,
+                                     price=_last_result.price,
+                                     vwap=_last_result.vwap,
+                                     rsi=_last_result.rsi)
+            else:
+                telegram.send_health(loop_count, uptime)
             logger.info("Health check — uptime=%.1fh  loops=%d", uptime / 3600, loop_count)
 
         if _shutdown_requested:
