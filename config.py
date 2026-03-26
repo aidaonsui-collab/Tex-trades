@@ -35,7 +35,7 @@ RSI_PERIOD: int = 14               # RSI calculation period
 RSI_LOWER: float = 35.0            # RSI must be ABOVE this for a valid signal
 RSI_UPPER: float = 65.0            # RSI must be BELOW this for a valid signal
 LOOP_INTERVAL_SECONDS: int = 900   # 15 minutes — matches candle timeframe
-HEALTH_LOG_INTERVAL: int = 4       # Log health status every N loops (~1 hr)
+HEALTH_LOG_INTERVAL: int = 2       # Log health status every N loops (~30 min)
 
 # ─────────────────────────────────────────────
 # Telegram
