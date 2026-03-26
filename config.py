@@ -82,11 +82,9 @@ def validate():
         if not LITE_AGENT_API_KEY:
             errors.append("LITE_AGENT_API_KEY is required when DRY_RUN=false")
 
-    if not TELEGRAM_BOT_TOKEN:
-        errors.append("TELEGRAM_BOT_TOKEN is required")
-
-    if not TELEGRAM_CHAT_ID:
-        errors.append("TELEGRAM_CHAT_ID is required")
+    # Telegram is optional — bot runs without alerts if not configured
+    if TELEGRAM_BOT_TOKEN and not TELEGRAM_CHAT_ID:
+        errors.append("TELEGRAM_CHAT_ID is required when TELEGRAM_BOT_TOKEN is set")
 
     if LEVERAGE < 1 or LEVERAGE > 50:
         errors.append(f"LEVERAGE must be between 1 and 50, got {LEVERAGE}")
