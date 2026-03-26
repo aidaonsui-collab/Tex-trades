@@ -48,8 +48,20 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 # DRY_RUN=false → live trading, real orders executed on Hyperliquid
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
-# Path to persist position state across restarts
+# Path to persist position state across restarts (used when Upstash is not configured)
 STATE_FILE: str = os.getenv("STATE_FILE", "position_state.json")
+
+# ─────────────────────────────────────────────
+# Upstash Redis (optional — for persistent state on Railway)
+# ─────────────────────────────────────────────
+# When both vars are set the bot stores position state in Upstash Redis so
+# that state survives Railway restarts and redeploys.  If either var is
+# absent the bot falls back to the local STATE_FILE JSON file.
+#
+# Get these values from your Upstash console at https://console.upstash.com
+# after creating a Redis database (free tier is sufficient).
+UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 # Exponential backoff settings for API retries
 RETRY_MAX_ATTEMPTS: int = 5

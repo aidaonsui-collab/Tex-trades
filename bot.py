@@ -8,7 +8,7 @@ Architecture:
       2. Compute VWAP cross + RSI signal
       3. If flat: check for entry signal → place order
       4. If in position: check for exit signal → close position
-  - Position state persisted to JSON file for crash recovery
+  - Position state persisted to Upstash Redis (if configured) or local JSON file
   - Telegram alerts on every meaningful event
   - Graceful shutdown on SIGTERM / SIGINT
   - Periodic health heartbeat every ~1 hour
@@ -25,6 +25,8 @@ import signal
 import sys
 import time
 from typing import Optional
+
+import requests
 
 import config
 import exchange
@@ -47,18 +49,100 @@ logger = logging.getLogger("bot")
 # Position state
 # ─────────────────────────────────────────────
 
-class PositionState:
+class RedisState:
     """
-    In-memory position tracker persisted to a JSON file so state survives
-    bot restarts (important when deployed on Railway).
+    Upstash Redis backend for position state, accessed via the Upstash HTTP
+    REST API.  No Redis client library is required — uses the `requests`
+    package that is already in requirements.txt.
+
+    Upstash REST API docs: https://upstash.com/docs/redis/features/restapi
     """
 
-    def __init__(self, filepath: str):
+    # Redis key used to store the position state JSON blob
+    KEY = "vwap_bot:position"
+
+    def __init__(self, url: str, token: str) -> None:
+        # Remove any trailing slash so URL construction is consistent
+        self.base_url = url.rstrip("/")
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def _exec(self, *args):
+        """
+        Execute an arbitrary Redis command via the Upstash REST endpoint.
+        Commands are sent as a JSON array: ["COMMAND", "arg1", "arg2", ...].
+        Returns the "result" field from the Upstash JSON response.
+        """
+        resp = requests.post(
+            self.base_url,
+            headers=self.headers,
+            json=list(args),
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return resp.json().get("result")
+
+    def save(self, data: dict) -> bool:
+        """
+        Serialise `data` to a JSON string and store it in Redis under KEY.
+        Returns True on success, False if the request failed (caller should
+        fall back to local file storage).
+        """
+        try:
+            self._exec("SET", self.KEY, json.dumps(data))
+            return True
+        except Exception as exc:
+            logger.warning("Upstash Redis save failed: %s", exc)
+            return False
+
+    def load(self) -> Optional[dict]:
+        """
+        Retrieve and deserialise position state from Redis.
+        Returns None if the key does not exist or the request failed.
+        """
+        try:
+            raw = self._exec("GET", self.KEY)
+            if raw is None:
+                return None
+            return json.loads(raw)
+        except Exception as exc:
+            logger.warning("Upstash Redis load failed: %s", exc)
+            return None
+
+
+class PositionState:
+    """
+    In-memory position tracker with pluggable persistence backends.
+
+    Priority order:
+      1. Upstash Redis (if UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
+         are set in the environment) — survives Railway restarts/redeploys.
+      2. Local JSON file (STATE_FILE) — used when Upstash is not configured,
+         or as an emergency write-through fallback if a Redis save fails.
+
+    The public interface (open / close / is_open) is unchanged — the rest of
+    bot.py does not need to know which backend is active.
+    """
+
+    def __init__(self, filepath: str) -> None:
         self.filepath = filepath
-        self.side: Optional[str] = None          # "LONG" | "SHORT" | None
-        self.size: float = 0.0                   # base asset units
+        self.side: Optional[str] = None       # "LONG" | "SHORT" | None
+        self.size: float = 0.0                # base asset units
         self.entry_price: float = 0.0
-        self.entry_time: float = 0.0             # unix timestamp
+        self.entry_time: float = 0.0          # unix timestamp
+
+        # Select backend based on environment variables
+        redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+        redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        if redis_url and redis_token:
+            self._redis: Optional[RedisState] = RedisState(redis_url, redis_token)
+            logger.info("Position state backend: Upstash Redis")
+        else:
+            self._redis = None
+            logger.info("Position state backend: local file (%s)", filepath)
+
         self._load()
 
     def is_open(self) -> bool:
@@ -86,39 +170,71 @@ class PositionState:
         self._save()
         return snapshot
 
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    def _current_data(self) -> dict:
+        return {
+            "side": self.side,
+            "size": self.size,
+            "entry_price": self.entry_price,
+            "entry_time": self.entry_time,
+        }
+
     def _save(self) -> None:
+        data = self._current_data()
+        if self._redis is not None:
+            # Attempt Redis first; write to local file as emergency backup
+            # if the Redis call fails (e.g., network blip).
+            if not self._redis.save(data):
+                logger.warning("Redis save failed — writing emergency backup to local file")
+                self._save_to_file(data)
+        else:
+            self._save_to_file(data)
+
+    def _save_to_file(self, data: dict) -> None:
         try:
             with open(self.filepath, "w") as f:
-                json.dump(
-                    {
-                        "side": self.side,
-                        "size": self.size,
-                        "entry_price": self.entry_price,
-                        "entry_time": self.entry_time,
-                    },
-                    f,
-                    indent=2,
-                )
+                json.dump(data, f, indent=2)
         except OSError as exc:
-            logger.warning("Could not save position state: %s", exc)
+            logger.warning("Could not save position state to file: %s", exc)
 
     def _load(self) -> None:
-        if not os.path.exists(self.filepath):
-            return
-        try:
-            with open(self.filepath) as f:
-                data = json.load(f)
+        data: Optional[dict] = None
+
+        if self._redis is not None:
+            data = self._redis.load()
+            if data is None:
+                # Redis returned nothing (first run, key expired, etc.).
+                # Check the local file so we don't lose state on the first
+                # deployment after adding Upstash.
+                logger.info(
+                    "No state found in Redis — checking local file fallback (%s)",
+                    self.filepath,
+                )
+                data = self._load_from_file()
+        else:
+            data = self._load_from_file()
+
+        if data:
             self.side = data.get("side")
             self.size = float(data.get("size", 0))
             self.entry_price = float(data.get("entry_price", 0))
             self.entry_time = float(data.get("entry_time", 0))
             if self.side:
                 logger.info(
-                    "Restored position from state file: %s %.4f @ $%.2f",
+                    "Restored position from state: %s %.4f @ $%.2f",
                     self.side, self.size, self.entry_price,
                 )
+
+    def _load_from_file(self) -> Optional[dict]:
+        if not os.path.exists(self.filepath):
+            return None
+        try:
+            with open(self.filepath) as f:
+                return json.load(f)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Could not load position state: %s", exc)
+            logger.warning("Could not load position state from file: %s", exc)
+            return None
 
 
 # ─────────────────────────────────────────────
