@@ -30,8 +30,8 @@ POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "50"))
 CANDLE_INTERVAL: str = "15m"       # Hyperliquid candle interval string
 CANDLE_LOOKBACK: int = 100         # Number of candles to fetch each cycle
 RSI_PERIOD: int = 14               # RSI calculation period
-RSI_LOWER: float = 40.0            # RSI must be ABOVE this for a valid signal
-RSI_UPPER: float = 60.0            # RSI must be BELOW this for a valid signal
+RSI_LOWER: float = 35.0            # RSI must be ABOVE this for a valid signal
+RSI_UPPER: float = 65.0            # RSI must be BELOW this for a valid signal
 LOOP_INTERVAL_SECONDS: int = 900   # 15 minutes — matches candle timeframe
 HEALTH_LOG_INTERVAL: int = 4       # Log health status every N loops (~1 hr)
 
