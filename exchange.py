@@ -1,15 +1,21 @@
 """
-exchange.py — Hyperliquid REST API integration.
+exchange.py — Trading execution via DegenClaw ACP job system.
 
 Responsibilities:
-  - Fetch live OHLCV candle data via the public /info endpoint
-  - Place market orders (long/short) via the hyperliquid-python-sdk
-  - Close open positions
-  - Query current position state from the exchange
+  - Fetch live OHLCV candle data via Hyperliquid public /info endpoint
+  - Submit perp trade jobs via the DegenClaw ACP API
+  - Poll job status until filled or timeout
+  - Close open positions via the same ACP job channel
   - Exponential backoff on transient failures
 
 All order-side logic respects DRY_RUN mode: in dry-run, order calls are
-logged but never sent to the exchange.
+logged but never sent.
+
+ACP API:
+  Base URL : https://claw-api.virtuals.io
+  Auth     : x-api-key: <LITE_AGENT_API_KEY>
+  Provider : 0xd478a8B40372db16cA8045F28C6FE07228F3781A  (DegenClaw)
+  Offering : perp_trade
 """
 
 import json
@@ -25,16 +31,22 @@ from strategy import Candle
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# DegenClaw ACP constants
+# ─────────────────────────────────────────────
+ACP_BASE_URL       = "https://claw-api.virtuals.io"
+DGCLAW_PROVIDER    = "0xd478a8B40372db16cA8045F28C6FE07228F3781A"
+DGCLAW_OFFERING    = "perp_trade"
+JOB_POLL_INTERVAL  = 3      # seconds between status polls
+JOB_TIMEOUT        = 60     # seconds to wait for job completion
+
 
 # ─────────────────────────────────────────────
 # Retry / backoff helper
 # ─────────────────────────────────────────────
 
 def _with_backoff(fn, *args, label: str = "", **kwargs):
-    """
-    Call `fn(*args, **kwargs)` with exponential backoff on exception.
-    Raises the last exception if all retries are exhausted.
-    """
+    """Call fn(*args, **kwargs) with exponential backoff on exception."""
     delay = config.RETRY_BASE_DELAY
     for attempt in range(1, config.RETRY_MAX_ATTEMPTS + 1):
         try:
@@ -54,21 +66,47 @@ def _with_backoff(fn, *args, label: str = "", **kwargs):
 
 
 # ─────────────────────────────────────────────
-# Candle data
+# ACP HTTP helpers
+# ─────────────────────────────────────────────
+
+def _acp_headers() -> dict:
+    return {
+        "x-api-key": config.LITE_AGENT_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def _acp_post(path: str, body: dict) -> dict:
+    resp = requests.post(
+        f"{ACP_BASE_URL}{path}",
+        headers=_acp_headers(),
+        json=body,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _acp_get(path: str) -> dict:
+    resp = requests.get(
+        f"{ACP_BASE_URL}{path}",
+        headers=_acp_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ─────────────────────────────────────────────
+# Candle data (public Hyperliquid endpoint)
 # ─────────────────────────────────────────────
 
 def get_candles(symbol: str, interval: str, count: int) -> list[Candle]:
     """
     Fetch the most recent `count` OHLCV candles for `symbol` at `interval`.
-
-    Uses the Hyperliquid public REST endpoint:
-      POST https://api.hyperliquid.xyz/info
-      body: {"type": "candleSnapshot", "req": {"coin": "BTC", "interval": "15m",
-             "startTime": <ms>, "endTime": <ms>}}
-
-    Returns a list of Candle dicts ordered oldest → newest.
+    Uses the Hyperliquid public REST endpoint (no auth required).
+    Returns candles ordered oldest → newest.
     """
-    # Request enough history: each 15m candle = 900s
     interval_seconds = _interval_to_seconds(interval)
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - (count * interval_seconds * 1000)
@@ -96,8 +134,6 @@ def get_candles(symbol: str, interval: str, count: int) -> list[Candle]:
 
     candles: list[Candle] = []
     for entry in raw:
-        # Hyperliquid candle fields: t (open time ms), T (close time ms),
-        # s (symbol), i (interval), o/h/l/c (prices), v (volume), n (trades)
         try:
             candles.append(
                 Candle(
@@ -125,7 +161,6 @@ def get_candles(symbol: str, interval: str, count: int) -> list[Candle]:
 
 
 def _interval_to_seconds(interval: str) -> int:
-    """Convert an interval string like '15m', '1h', '1d' to seconds."""
     mapping = {"m": 60, "h": 3600, "d": 86400}
     unit = interval[-1]
     value = int(interval[:-1])
@@ -133,58 +168,11 @@ def _interval_to_seconds(interval: str) -> int:
 
 
 # ─────────────────────────────────────────────
-# Exchange client (lazy init)
+# Price / sizing helpers
 # ─────────────────────────────────────────────
-
-_exchange_client = None  # hyperliquid.exchange.Exchange instance
-
-
-def _get_client():
-    """
-    Lazily initialise and return the Hyperliquid SDK exchange client.
-    Raises RuntimeError in DRY_RUN mode (client should never be called then).
-    """
-    global _exchange_client
-    if config.DRY_RUN:
-        raise RuntimeError("_get_client() called in DRY_RUN mode — this is a bug")
-    if _exchange_client is None:
-        # Import here to avoid hard dependency when only using public endpoints
-        from eth_account import Account
-        from hyperliquid.exchange import Exchange
-        from hyperliquid.utils import constants
-
-        account = Account.from_key(config.HYPERLIQUID_PRIVATE_KEY)
-        _exchange_client = Exchange(
-            account,
-            constants.MAINNET_API_URL,
-        )
-        logger.info("Hyperliquid exchange client initialised (wallet: %s)", account.address)
-    return _exchange_client
-
-
-# ─────────────────────────────────────────────
-# Order helpers
-# ─────────────────────────────────────────────
-
-def set_leverage(symbol: str, leverage: int) -> None:
-    """Set cross-margin leverage for the symbol. No-op in DRY_RUN."""
-    if config.DRY_RUN:
-        logger.info("[DRY RUN] Would set leverage to %dx for %s", leverage, symbol)
-        return
-    client = _get_client()
-
-    def _set():
-        result = client.update_leverage(leverage, symbol, is_cross=True)
-        logger.info("Leverage set to %dx for %s: %s", leverage, symbol, result)
-
-    _with_backoff(_set, label="set_leverage")
-
 
 def get_current_price(symbol: str) -> float:
-    """
-    Fetch the latest mid price for `symbol` from the Hyperliquid info endpoint.
-    Used for DRY_RUN position sizing.
-    """
+    """Fetch the latest mid price for `symbol` from the Hyperliquid info endpoint."""
     def _fetch():
         resp = requests.post(
             f"{config.HYPERLIQUID_API_URL}/info",
@@ -199,30 +187,95 @@ def get_current_price(symbol: str) -> float:
 
 
 def calculate_size(price: float, size_usd: float, leverage: int) -> float:
-    """
-    Calculate position size in base asset units.
-    size_usd is the notional value (pre-leverage exposure).
-    We floor to 4 decimal places to stay within Hyperliquid's precision.
-    """
+    """Calculate position size in base asset units (floored to 4 d.p.)."""
     raw = (size_usd * leverage) / price
     return math.floor(raw * 10_000) / 10_000
 
 
+def set_leverage(symbol: str, leverage: int) -> None:
+    """No-op — leverage is passed in the ACP job requirements."""
+    logger.info("[ACP] Leverage %dx for %s will be sent with the job request", leverage, symbol)
+
+
+# ─────────────────────────────────────────────
+# ACP job submission
+# ─────────────────────────────────────────────
+
+def _submit_acp_job(requirements: dict) -> dict:
+    """
+    Submit a perp_trade job to DegenClaw and wait for completion.
+    Returns the final job status dict, or raises on timeout / failure.
+    """
+    # Create job
+    body = {
+        "providerWalletAddress": DGCLAW_PROVIDER,
+        "jobOfferingName": DGCLAW_OFFERING,
+        "serviceRequirements": requirements,
+        "isAutomated": True,
+    }
+    logger.info("[ACP] Submitting job: %s", json.dumps(requirements))
+
+    def _create():
+        return _acp_post("/acp/jobs", body)
+
+    result = _with_backoff(_create, label="acp_job_create")
+    job_id = (result.get("data") or {}).get("jobId") or result.get("jobId")
+
+    if not job_id:
+        raise RuntimeError(f"ACP job create returned no jobId: {result}")
+
+    logger.info("[ACP] Job created: id=%s", job_id)
+
+    # Poll for completion
+    deadline = time.time() + JOB_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(JOB_POLL_INTERVAL)
+        status_resp = _acp_get(f"/acp/jobs/{job_id}")
+        job = (status_resp.get("data") or {})
+        phase = job.get("phase", "UNKNOWN")
+        logger.debug("[ACP] Job %s phase: %s", job_id, phase)
+
+        if phase in ("COMPLETED", "DELIVERED", "DONE"):
+            logger.info("[ACP] Job %s completed. Deliverable: %s", job_id, job.get("deliverable"))
+            return job
+
+        if phase in ("FAILED", "CANCELLED", "REJECTED", "EXPIRED"):
+            raise RuntimeError(f"ACP job {job_id} ended with phase={phase}: {job}")
+
+        if phase == "PENDING_PAYMENT":
+            # Auto-approve payment
+            logger.info("[ACP] Job %s awaiting payment approval — auto-approving", job_id)
+            try:
+                _acp_post(
+                    f"/acp/providers/jobs/{job_id}/negotiation",
+                    {"accept": True, "content": "auto-approved by trading bot"},
+                )
+            except Exception as e:
+                logger.warning("[ACP] Auto-approve failed (non-fatal): %s", e)
+
+    raise TimeoutError(f"ACP job {job_id} did not complete within {JOB_TIMEOUT}s")
+
+
+# ─────────────────────────────────────────────
+# Order interface (same API as before)
+# ─────────────────────────────────────────────
+
 def place_market_order(
     symbol: str,
-    side: str,          # "buy" or "sell"
+    side: str,          # "buy" (long) or "sell" (short)
     size: float,
     reduce_only: bool = False,
 ) -> dict:
     """
-    Place a market order on Hyperliquid.
+    Place a market order via the DegenClaw ACP job system.
 
-    In DRY_RUN mode this function logs what would be placed and returns a
-    synthetic response dict — no real order is sent.
-
-    Returns the exchange response dict on success.
+    In DRY_RUN mode logs the intended order and returns a synthetic response.
+    In live mode, submits an ACP perp_trade job and waits for confirmation.
     """
-    label = f"{'[DRY RUN] ' if config.DRY_RUN else ''}place_market_order"
+    action = "close" if reduce_only else "open"
+    acp_side = "long" if side.lower() == "buy" else "short"
+
+    label = f"{'[DRY RUN] ' if config.DRY_RUN else '[ACP] '}place_market_order"
     logger.info(
         "%s: %s %s %.4f (reduce_only=%s)", label, side.upper(), symbol, size, reduce_only
     )
@@ -237,72 +290,33 @@ def place_market_order(
             "reduce_only": reduce_only,
         }
 
-    client = _get_client()
+    requirements = {
+        "action": action,
+        "pair": symbol,
+        "side": acp_side,
+        "size": str(size),
+        "leverage": config.LEVERAGE,
+    }
 
-    def _place():
-        is_buy = side.lower() == "buy"
-        # Hyperliquid SDK market order: order_type={"limit": {"tif": "Ioc"}} with
-        # a wide price acts as a market order (taker fill guaranteed).
-        # Alternatively use the market order helper directly.
-        result = client.market_open(
-            symbol,
-            is_buy,
-            size,
-            None,          # slippage — None uses SDK default (5%)
-            reduce_only,
-        )
-        if result.get("status") != "ok":
-            raise RuntimeError(f"Order rejected: {result}")
-        return result
-
-    return _with_backoff(_place, label="place_market_order")
+    job = _submit_acp_job(requirements)
+    return {"status": "ok", "acp_job": job}
 
 
 def close_position(symbol: str, side: str, size: float) -> dict:
     """
-    Close an existing position by placing a reduce-only market order
-    in the opposite direction.
-
-    `side`  : the side of the OPEN position ("LONG" or "SHORT")
-    `size`  : the size in base asset units to close
+    Close an existing position by submitting an ACP close job.
+    `side` is the side of the OPEN position ("LONG" or "SHORT").
     """
     close_side = "sell" if side == "LONG" else "buy"
     logger.info("Closing %s position: %s %.4f %s", side, close_side, size, symbol)
     return place_market_order(symbol, close_side, size, reduce_only=True)
 
 
-# ─────────────────────────────────────────────
-# Position query (live exchange)
-# ─────────────────────────────────────────────
-
 def get_open_position(symbol: str) -> Optional[dict]:
     """
-    Query the exchange for any currently open position in `symbol`.
-    Returns a dict with keys: side, size, entry_price — or None if flat.
-    Only used to reconcile state after restart; not called in DRY_RUN.
+    Query the exchange for any currently open position.
+    ACP does not expose a direct position query — returns None.
+    State is managed by bot.py's persistent state store.
     """
-    if config.DRY_RUN:
-        return None
-
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-    from eth_account import Account
-
-    account = Account.from_key(config.HYPERLIQUID_PRIVATE_KEY)
-    info = Info(constants.MAINNET_API_URL)
-
-    def _query():
-        state = info.user_state(account.address)
-        for pos in state.get("assetPositions", []):
-            p = pos.get("position", {})
-            if p.get("coin") == symbol:
-                sz = float(p.get("szi", 0))
-                if sz != 0:
-                    return {
-                        "side": "LONG" if sz > 0 else "SHORT",
-                        "size": abs(sz),
-                        "entry_price": float(p.get("entryPx", 0)),
-                    }
-        return None
-
-    return _with_backoff(_query, label="get_open_position")
+    logger.debug("get_open_position: state managed locally, returning None")
+    return None

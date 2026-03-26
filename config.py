@@ -10,9 +10,11 @@ load_dotenv()
 
 
 # ─────────────────────────────────────────────
-# Hyperliquid / Exchange
+# DegenClaw ACP / Exchange
 # ─────────────────────────────────────────────
-HYPERLIQUID_PRIVATE_KEY: str = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+# ACP API key — from ~/openclaw-acp/config.json (LITE_AGENT_API_KEY)
+LITE_AGENT_API_KEY: str = os.getenv("LITE_AGENT_API_KEY", "")
+# Hyperliquid public endpoint (candles + price feed, no auth needed)
 HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
 
 # Trading symbol (coin name as Hyperliquid expects it, e.g. "BTC")
@@ -77,8 +79,8 @@ def validate():
     errors = []
 
     if not DRY_RUN:
-        if not HYPERLIQUID_PRIVATE_KEY:
-            errors.append("HYPERLIQUID_PRIVATE_KEY is required when DRY_RUN=false")
+        if not LITE_AGENT_API_KEY:
+            errors.append("LITE_AGENT_API_KEY is required when DRY_RUN=false")
 
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN is required")
