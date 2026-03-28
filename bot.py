@@ -1,20 +1,17 @@
 """
-bot.py — Main entry point for the VWAP Cross trading bot.
+bot.py — Main entry point for the Momentum Breakout trading bot.
 
 Architecture:
-  - Runs a loop every LOOP_INTERVAL_SECONDS (15 minutes)
+  - Runs a loop every LOOP_INTERVAL_SECONDS (1 hour for 1h candles)
   - Each iteration:
       1. Fetch latest candles from Hyperliquid
-      2. Compute VWAP cross + RSI signal
-      3. If flat: check for entry signal → place order
-      4. If in position: check for exit signal → close position
-  - Position state persisted to Upstash Redis (if configured) or local JSON file
-  - Telegram alerts on every meaningful event
-  - Graceful shutdown on SIGTERM / SIGINT
-  - Periodic health heartbeat every ~1 hour
-
-Usage:
-  python bot.py
+      2. Check ATR stop/TP exit if position is open
+      3. Compute momentum breakout signal
+      4. If flat: check for entry signal → place order
+      5. If in position: check for signal flip exit
+  - Position state persisted to Upstash Redis or local JSON
+  - Telegram alerts with SL/TP levels, weekly P&L, and competition metrics
+  - Weekly summary sent at season reset
 """
 
 import json
@@ -24,6 +21,7 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -33,10 +31,6 @@ import exchange
 import strategy
 import telegram
 
-# ─────────────────────────────────────────────
-# Logging setup
-# ─────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -45,196 +39,189 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
+
 # ─────────────────────────────────────────────
-# Position state
+# Weekly P&L tracker
+# ─────────────────────────────────────────────
+
+class WeeklyTracker:
+    """Track trades and P&L for the current weekly season."""
+
+    def __init__(self):
+        self.trades: list[dict] = []
+        self.week_start = self._current_week_start()
+
+    @staticmethod
+    def _current_week_start() -> datetime:
+        now = datetime.now(timezone.utc)
+        # Week starts Monday 00:00 UTC
+        days_since_monday = now.weekday()
+        monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        monday = monday.replace(day=monday.day - days_since_monday)
+        return monday
+
+    def check_reset(self) -> Optional[dict]:
+        """Check if we've entered a new week. Returns summary if reset occurred."""
+        current_week = self._current_week_start()
+        if current_week > self.week_start and self.trades:
+            summary = self.get_summary()
+            self.trades = []
+            self.week_start = current_week
+            return summary
+        elif current_week > self.week_start:
+            self.week_start = current_week
+        return None
+
+    def add_trade(self, pnl: float, side: str, reason: str):
+        self.trades.append({"pnl": pnl, "side": side, "reason": reason,
+                            "ts": datetime.now(timezone.utc).isoformat()})
+
+    @property
+    def total_pnl(self) -> float:
+        return sum(t["pnl"] for t in self.trades)
+
+    @property
+    def total_trades(self) -> int:
+        return len(self.trades)
+
+    @property
+    def wins(self) -> int:
+        return sum(1 for t in self.trades if t["pnl"] > 0)
+
+    def get_summary(self) -> dict:
+        if not self.trades:
+            return {"trades": 0, "wins": 0, "pnl": 0, "sortino": 0, "pf": 0,
+                    "best": 0, "worst": 0}
+        wins = [t for t in self.trades if t["pnl"] > 0]
+        losses = [t for t in self.trades if t["pnl"] <= 0]
+        pnls = [t["pnl"] for t in self.trades]
+
+        gw = sum(t["pnl"] for t in wins) if wins else 0
+        gl = abs(sum(t["pnl"] for t in losses)) if losses else 0.01
+        pf = gw / gl if gl > 0 else 10.0
+
+        # Sortino ratio
+        rets = [p / config.POSITION_SIZE_USD for p in pnls]
+        mean_r = sum(rets) / len(rets)
+        downside = [min(0, r) ** 2 for r in rets]
+        dd = math.sqrt(sum(downside) / len(downside))
+        sortino = mean_r / dd if dd > 0 else (10.0 if mean_r > 0 else 0)
+
+        return {
+            "trades": len(self.trades), "wins": len(wins),
+            "pnl": self.total_pnl, "sortino": sortino, "pf": pf,
+            "best": max(pnls), "worst": min(pnls),
+        }
+
+
+# ─────────────────────────────────────────────
+# Position state (same as before, with ATR tracking)
 # ─────────────────────────────────────────────
 
 class RedisState:
-    """
-    Upstash Redis backend for position state, accessed via the Upstash HTTP
-    REST API.  No Redis client library is required — uses the `requests`
-    package that is already in requirements.txt.
+    KEY = "mombreak_bot:position"
 
-    Upstash REST API docs: https://upstash.com/docs/redis/features/restapi
-    """
-
-    # Redis key used to store the position state JSON blob
-    KEY = "vwap_bot:position"
-
-    def __init__(self, url: str, token: str) -> None:
-        # Remove any trailing slash so URL construction is consistent
+    def __init__(self, url: str, token: str):
         self.base_url = url.rstrip("/")
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
+        self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _exec(self, *args):
-        """
-        Execute an arbitrary Redis command via the Upstash REST endpoint.
-        Commands are sent as a JSON array: ["COMMAND", "arg1", "arg2", ...].
-        Returns the "result" field from the Upstash JSON response.
-        """
-        resp = requests.post(
-            self.base_url,
-            headers=self.headers,
-            json=list(args),
-            timeout=5,
-        )
+        resp = requests.post(self.base_url, headers=self.headers, json=list(args), timeout=5)
         resp.raise_for_status()
         return resp.json().get("result")
 
     def save(self, data: dict) -> bool:
-        """
-        Serialise `data` to a JSON string and store it in Redis under KEY.
-        Returns True on success, False if the request failed (caller should
-        fall back to local file storage).
-        """
-        try:
-            self._exec("SET", self.KEY, json.dumps(data))
-            return True
-        except Exception as exc:
-            logger.warning("Upstash Redis save failed: %s", exc)
-            return False
+        try: self._exec("SET", self.KEY, json.dumps(data)); return True
+        except Exception as e: logger.warning("Redis save failed: %s", e); return False
 
     def load(self) -> Optional[dict]:
-        """
-        Retrieve and deserialise position state from Redis.
-        Returns None if the key does not exist or the request failed.
-        """
         try:
             raw = self._exec("GET", self.KEY)
-            if raw is None:
-                return None
-            return json.loads(raw)
-        except Exception as exc:
-            logger.warning("Upstash Redis load failed: %s", exc)
-            return None
+            return json.loads(raw) if raw else None
+        except Exception as e: logger.warning("Redis load failed: %s", e); return None
 
 
 class PositionState:
-    """
-    In-memory position tracker with pluggable persistence backends.
-
-    Priority order:
-      1. Upstash Redis (if UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
-         are set in the environment) — survives Railway restarts/redeploys.
-      2. Local JSON file (STATE_FILE) — used when Upstash is not configured,
-         or as an emergency write-through fallback if a Redis save fails.
-
-    The public interface (open / close / is_open) is unchanged — the rest of
-    bot.py does not need to know which backend is active.
-    """
-
-    def __init__(self, filepath: str) -> None:
+    def __init__(self, filepath: str):
         self.filepath = filepath
-        self.side: Optional[str] = None       # "LONG" | "SHORT" | None
-        self.size: float = 0.0                # base asset units
+        self.side: Optional[str] = None
+        self.size: float = 0.0
         self.entry_price: float = 0.0
-        self.entry_time: float = 0.0          # unix timestamp
+        self.entry_time: float = 0.0
+        self.entry_atr: float = 0.0  # ATR at entry for stop/TP calculation
 
-        # Select backend based on environment variables
         redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
         redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
         if redis_url and redis_token:
             self._redis: Optional[RedisState] = RedisState(redis_url, redis_token)
-            logger.info("Position state backend: Upstash Redis")
+            logger.info("State backend: Upstash Redis")
         else:
             self._redis = None
-            logger.info("Position state backend: local file (%s)", filepath)
-
+            logger.info("State backend: local file (%s)", filepath)
         self._load()
 
     def is_open(self) -> bool:
         return self.side is not None
 
-    def open(self, side: str, size: float, price: float) -> None:
+    def open(self, side: str, size: float, price: float, entry_atr: float) -> None:
         self.side = side
         self.size = size
         self.entry_price = price
         self.entry_time = time.time()
+        self.entry_atr = entry_atr
         self._save()
 
     def close(self) -> dict:
-        """Clear state and return a snapshot of the closed position."""
-        snapshot = {
-            "side": self.side,
-            "size": self.size,
-            "entry_price": self.entry_price,
-            "entry_time": self.entry_time,
-        }
+        snapshot = {"side": self.side, "size": self.size,
+                    "entry_price": self.entry_price, "entry_time": self.entry_time,
+                    "entry_atr": self.entry_atr}
         self.side = None
         self.size = 0.0
         self.entry_price = 0.0
         self.entry_time = 0.0
+        self.entry_atr = 0.0
         self._save()
         return snapshot
 
-    # ── Private helpers ────────────────────────────────────────────────────
-
     def _current_data(self) -> dict:
-        return {
-            "side": self.side,
-            "size": self.size,
-            "entry_price": self.entry_price,
-            "entry_time": self.entry_time,
-        }
+        return {"side": self.side, "size": self.size, "entry_price": self.entry_price,
+                "entry_time": self.entry_time, "entry_atr": self.entry_atr}
 
-    def _save(self) -> None:
+    def _save(self):
         data = self._current_data()
-        if self._redis is not None:
-            # Attempt Redis first; write to local file as emergency backup
-            # if the Redis call fails (e.g., network blip).
-            if not self._redis.save(data):
-                logger.warning("Redis save failed — writing emergency backup to local file")
-                self._save_to_file(data)
-        else:
-            self._save_to_file(data)
+        if self._redis and not self._redis.save(data):
+            self._save_file(data)
+        elif not self._redis:
+            self._save_file(data)
 
-    def _save_to_file(self, data: dict) -> None:
+    def _save_file(self, data):
         try:
-            with open(self.filepath, "w") as f:
-                json.dump(data, f, indent=2)
-        except OSError as exc:
-            logger.warning("Could not save position state to file: %s", exc)
+            with open(self.filepath, "w") as f: json.dump(data, f, indent=2)
+        except OSError as e: logger.warning("File save failed: %s", e)
 
-    def _load(self) -> None:
-        data: Optional[dict] = None
-
-        if self._redis is not None:
+    def _load(self):
+        data = None
+        if self._redis:
             data = self._redis.load()
-            if data is None:
-                # Redis returned nothing (first run, key expired, etc.).
-                # Check the local file so we don't lose state on the first
-                # deployment after adding Upstash.
-                logger.info(
-                    "No state found in Redis — checking local file fallback (%s)",
-                    self.filepath,
-                )
-                data = self._load_from_file()
+            if not data: data = self._load_file()
         else:
-            data = self._load_from_file()
-
+            data = self._load_file()
         if data:
             self.side = data.get("side")
             self.size = float(data.get("size", 0))
             self.entry_price = float(data.get("entry_price", 0))
             self.entry_time = float(data.get("entry_time", 0))
+            self.entry_atr = float(data.get("entry_atr", 0))
             if self.side:
-                logger.info(
-                    "Restored position from state: %s %.4f @ $%.2f",
-                    self.side, self.size, self.entry_price,
-                )
+                logger.info("Restored: %s %.4f @ $%.2f (ATR=%.2f)",
+                            self.side, self.size, self.entry_price, self.entry_atr)
 
-    def _load_from_file(self) -> Optional[dict]:
-        if not os.path.exists(self.filepath):
-            return None
+    def _load_file(self) -> Optional[dict]:
+        if not os.path.exists(self.filepath): return None
         try:
-            with open(self.filepath) as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Could not load position state from file: %s", exc)
-            return None
+            with open(self.filepath) as f: return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("File load failed: %s", e); return None
 
 
 # ─────────────────────────────────────────────
@@ -243,97 +230,75 @@ class PositionState:
 
 _shutdown_requested = False
 
-
 def _handle_shutdown(signum, frame):
     global _shutdown_requested
-    logger.info("Shutdown signal received (%s) — finishing current loop then exiting", signum)
+    logger.info("Shutdown signal (%s) — finishing current loop", signum)
     _shutdown_requested = True
-
 
 signal.signal(signal.SIGTERM, _handle_shutdown)
 signal.signal(signal.SIGINT, _handle_shutdown)
 
 
 # ─────────────────────────────────────────────
-# Core trading logic
+# Trading logic
 # ─────────────────────────────────────────────
 
-def handle_entry(result: strategy.SignalResult, state: PositionState) -> None:
-    """
-    Process a potential entry signal when no position is open.
-    Computes size, places market order, updates state, sends Telegram alert.
-    """
+def handle_entry(result: strategy.SignalResult, state: PositionState,
+                 tracker: WeeklyTracker) -> None:
     sig = result.signal
     price = result.price
 
-    # Calculate position size in base asset units
     size = exchange.calculate_size(price, config.POSITION_SIZE_USD, config.LEVERAGE)
     if size <= 0:
-        logger.error(
-            "Computed position size is zero (price=%.2f, usd=%.2f, lev=%d)",
-            price, config.POSITION_SIZE_USD, config.LEVERAGE,
-        )
+        logger.error("Zero size (price=%.2f)", price)
         return
 
-    logger.info(
-        "Entry signal: %s  price=$%.2f  size=%.4f  leverage=%dx",
-        sig, price, size, config.LEVERAGE,
+    logger.info("Entry: %s price=$%.2f size=%.4f atr=%.2f lev=%dx",
+                sig, price, size, result.atr, config.LEVERAGE)
+
+    # Telegram signal alert with all indicator values
+    telegram.send_signal(
+        sig, price, result.atr, result.roc,
+        result.channel_high, result.channel_low, result.ema_trend,
+        result.volume, result.volume_avg,
     )
 
-    # Telegram: signal detected
-    telegram.send_signal(sig, price, result.vwap, result.rsi)
-
-    # Set leverage (no-op in DRY_RUN)
     try:
         exchange.set_leverage(config.SYMBOL, config.LEVERAGE)
     except Exception as exc:
-        logger.error("Failed to set leverage: %s", exc)
+        logger.error("Leverage failed: %s", exc)
         telegram.send_error("set_leverage failed", exc)
         return
 
-    # Place order
     order_side = "buy" if sig == "LONG" else "sell"
     try:
         exchange.place_market_order(config.SYMBOL, order_side, size)
     except Exception as exc:
-        logger.error("Order placement failed: %s", exc)
+        logger.error("Order failed: %s", exc)
         telegram.send_error("place_market_order failed", exc)
         return
 
-    # Update state
-    state.open(sig, size, price)
+    state.open(sig, size, price, result.atr)
 
-    # Telegram: order placed
-    telegram.send_order_placed(
-        sig, size, price, config.LEVERAGE, dry_run=config.DRY_RUN
-    )
+    telegram.send_order_placed(sig, size, price, config.LEVERAGE, result.atr,
+                               dry_run=config.DRY_RUN)
 
 
-def handle_exit(result: strategy.SignalResult, state: PositionState) -> None:
-    """
-    Process an exit when the current signal flips against the open position.
-    Closes the position, calculates estimated PnL, updates state, alerts.
-    """
-    exit_price = result.price
-    snapshot = {
-        "side": state.side,
-        "size": state.size,
-        "entry_price": state.entry_price,
-    }
+def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
+                tracker: WeeklyTracker) -> None:
+    snapshot = {"side": state.side, "size": state.size,
+                "entry_price": state.entry_price}
 
-    logger.info(
-        "Exit signal: %s position at $%.2f (entry was $%.2f)",
-        snapshot["side"], exit_price, snapshot["entry_price"],
-    )
+    logger.info("Exit: %s @ $%.2f (entry $%.2f) reason=%s",
+                snapshot["side"], exit_price, snapshot["entry_price"], exit_reason)
 
     try:
         exchange.close_position(config.SYMBOL, snapshot["side"], snapshot["size"])
     except Exception as exc:
-        logger.error("Failed to close position: %s", exc)
+        logger.error("Close failed: %s", exc)
         telegram.send_error("close_position failed", exc)
         return
 
-    # Estimate PnL (before fees / funding)
     entry = snapshot["entry_price"]
     size = snapshot["size"]
     if snapshot["side"] == "LONG":
@@ -342,13 +307,14 @@ def handle_exit(result: strategy.SignalResult, state: PositionState) -> None:
         pnl = (entry - exit_price) * size * config.LEVERAGE
 
     state.close()
+    tracker.add_trade(pnl, snapshot["side"], exit_reason)
 
     telegram.send_position_closed(
-        snapshot["side"],
-        entry,
-        exit_price,
-        size,
-        pnl,
+        snapshot["side"], entry, exit_price, size, pnl,
+        exit_reason=exit_reason,
+        weekly_pnl=tracker.total_pnl,
+        weekly_trades=tracker.total_trades,
+        weekly_wins=tracker.wins,
         dry_run=config.DRY_RUN,
     )
 
@@ -357,118 +323,143 @@ def handle_exit(result: strategy.SignalResult, state: PositionState) -> None:
 # Main loop
 # ─────────────────────────────────────────────
 
-def run_loop(state: PositionState):
-    """Execute a single strategy iteration. Returns the strategy result for heartbeat tracking."""
-    try:
-        candles = exchange.get_candles(
-            config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK
+def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list) -> Optional[strategy.SignalResult]:
+    """Single strategy iteration."""
+    # Check weekly reset
+    summary = tracker.check_reset()
+    if summary and summary["trades"] > 0:
+        telegram.send_weekly_summary(
+            summary["trades"], summary["wins"], summary["pnl"],
+            summary["sortino"], summary["pf"],
+            summary["best"], summary["worst"],
         )
-    except Exception as exc:
-        logger.error("Failed to fetch candles: %s", exc)
-        telegram.send_error("get_candles failed", exc)
-        return None
 
+    # Compute signal
     try:
         result = strategy.compute_signal(candles)
     except Exception as exc:
-        logger.error("Strategy computation error: %s", exc)
+        logger.error("Strategy error: %s", exc)
         telegram.send_error("compute_signal failed", exc)
         return None
 
-    logger.info(
-        "Signal=%s  price=$%.2f  vwap=$%.2f  rsi=%.2f  position=%s",
-        result.signal, result.price, result.vwap, result.rsi,
-        state.side if state.is_open() else "FLAT",
-    )
+    logger.info("Signal=%s price=$%.2f atr=$%.2f roc=%.2f%% trend=%s pos=%s",
+                result.signal, result.price, result.atr, result.roc,
+                result.trend_direction, state.side or "FLAT")
 
     if state.is_open():
-        # Check for exit
-        if strategy.is_exit_signal(result.signal, state.side):
-            handle_exit(result, state)
+        # Check ATR stop/TP on latest candle
+        latest_candle = candles[-1]
+        should_exit, reason, exit_price = strategy.check_exit(
+            latest_candle, state.side, state.entry_price, state.entry_atr
+        )
+
+        if should_exit:
+            handle_exit(exit_price, reason, state, tracker)
+        elif strategy.is_exit_signal(result.signal, state.side):
+            handle_exit(result.price, "signal", state, tracker)
         else:
-            logger.debug("Holding %s position — no exit signal", state.side)
+            logger.debug("Holding %s — no exit", state.side)
     else:
-        # Check for entry
         if result.signal in ("LONG", "SHORT"):
-            handle_entry(result, state)
+            handle_entry(result, state, tracker)
         else:
-            logger.debug("Flat — no entry signal this candle")
+            logger.debug("Flat — no signal")
 
     return result
 
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("VWAP Cross Trading Bot starting up")
-    logger.info("Symbol=%s  Leverage=%dx  Size=$%.0f  DryRun=%s",
-                config.SYMBOL, config.LEVERAGE,
+    logger.info("Momentum Breakout Bot starting")
+    logger.info("Symbol=%s  Interval=%s  Leverage=%dx  Size=$%.0f  DryRun=%s",
+                config.SYMBOL, config.CANDLE_INTERVAL, config.LEVERAGE,
                 config.POSITION_SIZE_USD, config.DRY_RUN)
+    logger.info("Breakout: LB=%d  ROC=%.1f%%  Vol=%.1fx  EMA=%d  ATR=%.1fx  RR=%.1f:1",
+                config.BREAKOUT_LOOKBACK, config.ROC_THRESHOLD,
+                config.VOLUME_MULTIPLIER, config.TREND_EMA_PERIOD,
+                config.ATR_MULTIPLIER, config.REWARD_RISK_RATIO)
     logger.info("=" * 60)
 
-    # Validate config — raises on misconfiguration
     try:
         config.validate()
     except EnvironmentError as exc:
-        logger.critical("Config validation failed:\n%s", exc)
+        logger.critical("Config error:\n%s", exc)
         sys.exit(1)
 
-    # Reconcile state with live exchange (only in live mode)
     state = PositionState(config.STATE_FILE)
+    tracker = WeeklyTracker()
+
+    # Reconcile with exchange
     if not config.DRY_RUN and not state.is_open():
         try:
             live_pos = exchange.get_open_position(config.SYMBOL)
             if live_pos:
-                logger.info(
-                    "Found open exchange position not in state file — syncing: %s", live_pos
-                )
-                state.open(live_pos["side"], live_pos["size"], live_pos["entry_price"])
+                logger.info("Syncing live position: %s", live_pos)
+                state.open(live_pos["side"], live_pos["size"],
+                           live_pos["entry_price"], 0)
         except Exception as exc:
-            logger.warning("Could not reconcile position state: %s", exc)
+            logger.warning("Position sync failed: %s", exc)
 
-    # Send startup notification
     telegram.send_startup()
 
     start_time = time.time()
     loop_count = 0
-    _last_result = None  # track latest market snapshot for heartbeat
+    _last_result = None
 
     while not _shutdown_requested:
         loop_start = time.time()
         loop_count += 1
         logger.info("─── Loop %d ───", loop_count)
 
-        result = run_loop(state)
-        if result is not None:
-            _last_result = result
+        # Fetch candles
+        try:
+            candles = exchange.get_candles(
+                config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK
+            )
+        except Exception as exc:
+            logger.error("Candle fetch failed: %s", exc)
+            telegram.send_error("get_candles failed", exc)
+            candles = None
 
-        # Periodic health heartbeat — include market snapshot if available
+        if candles:
+            result = run_loop(state, tracker, candles)
+            if result:
+                _last_result = result
+
+        # Heartbeat
         if loop_count % config.HEALTH_LOG_INTERVAL == 0:
             uptime = time.time() - start_time
-            if _last_result is not None:
-                telegram.send_health(loop_count, uptime,
-                                     price=_last_result.price,
-                                     vwap=_last_result.vwap,
-                                     rsi=_last_result.rsi)
+            if _last_result:
+                telegram.send_health(
+                    loop_count, uptime,
+                    price=_last_result.price,
+                    atr=_last_result.atr,
+                    roc=_last_result.roc,
+                    ema_trend=_last_result.ema_trend,
+                    channel_high=_last_result.channel_high,
+                    channel_low=_last_result.channel_low,
+                    position_side=state.side,
+                    position_entry=state.entry_price if state.is_open() else None,
+                    weekly_pnl=tracker.total_pnl,
+                    weekly_trades=tracker.total_trades,
+                )
             else:
                 telegram.send_health(loop_count, uptime)
-            logger.info("Health check — uptime=%.1fh  loops=%d", uptime / 3600, loop_count)
 
         if _shutdown_requested:
             break
 
-        # Sleep until next candle boundary
         elapsed = time.time() - loop_start
         sleep_time = max(0, config.LOOP_INTERVAL_SECONDS - elapsed)
-        logger.info("Sleeping %.1fs until next iteration", sleep_time)
+        logger.info("Sleeping %.0fs", sleep_time)
 
-        # Sleep in small increments so we can respond to shutdown quickly
         slept = 0.0
         while slept < sleep_time and not _shutdown_requested:
             chunk = min(5.0, sleep_time - slept)
             time.sleep(chunk)
             slept += chunk
 
-    logger.info("Shutdown complete after %d loops", loop_count)
+    logger.info("Shutdown after %d loops", loop_count)
 
 
 if __name__ == "__main__":

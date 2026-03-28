@@ -1,5 +1,9 @@
 """
-config.py — Centralised configuration for the VWAP Cross trading bot.
+config.py — Centralised configuration for the Momentum Breakout trading bot.
+
+Strategy: Momentum Breakout + EMA Trend Filter + ATR Stops
+Optimised for Degen Claw weekly competition (Sortino + Return% + PF).
+
 All settings are loaded from environment variables with safe defaults.
 """
 
@@ -12,30 +16,48 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # DegenClaw ACP / Exchange
 # ─────────────────────────────────────────────
-# ACP API key — from ~/openclaw-acp/config.json (LITE_AGENT_API_KEY)
 LITE_AGENT_API_KEY: str = os.getenv("LITE_AGENT_API_KEY", "")
-# Hyperliquid public endpoint (candles + price feed, no auth needed)
 HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
 
-# Trading symbol (coin name as Hyperliquid expects it, e.g. "BTC")
-SYMBOL: str = os.getenv("SYMBOL", "BTC")
+# Trading symbol — SOL outperforms BTC/ETH for breakout strategies
+SYMBOL: str = os.getenv("SYMBOL", "SOL")
 
-# Leverage to use when opening positions (integer)
+# Leverage to use when opening positions
 LEVERAGE: int = int(os.getenv("LEVERAGE", "10"))
 
 # Notional size of each trade in USD
 POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "50"))
 
 # ─────────────────────────────────────────────
-# Strategy
+# Strategy — Momentum Breakout
 # ─────────────────────────────────────────────
-CANDLE_INTERVAL: str = "15m"       # Hyperliquid candle interval string
-CANDLE_LOOKBACK: int = 100         # Number of candles to fetch each cycle
-RSI_PERIOD: int = 14               # RSI calculation period
-RSI_LOWER: float = 35.0            # RSI must be ABOVE this for a valid signal
-RSI_UPPER: float = 65.0            # RSI must be BELOW this for a valid signal
-LOOP_INTERVAL_SECONDS: int = 900   # 15 minutes — matches candle timeframe
-HEALTH_LOG_INTERVAL: int = 2       # Log health status every N loops (~30 min)
+CANDLE_INTERVAL: str = os.getenv("CANDLE_INTERVAL", "1h")
+CANDLE_LOOKBACK: int = 100         # candles to fetch each cycle
+
+# Breakout detection
+BREAKOUT_LOOKBACK: int = int(os.getenv("BREAKOUT_LOOKBACK", "12"))
+    # Break above/below this many bars' high/low
+
+ROC_THRESHOLD: float = float(os.getenv("ROC_THRESHOLD", "1.0"))
+    # Rate of change (%) must exceed this for momentum confirmation
+
+VOLUME_MULTIPLIER: float = float(os.getenv("VOLUME_MULTIPLIER", "1.0"))
+    # Volume must be above SMA(20) * this multiplier
+
+# Trend filter
+TREND_EMA_PERIOD: int = int(os.getenv("TREND_EMA_PERIOD", "50"))
+    # Only long above EMA, only short below EMA
+
+# Risk management — ATR-based stops
+ATR_PERIOD: int = 14
+ATR_MULTIPLIER: float = float(os.getenv("ATR_MULTIPLIER", "2.0"))
+    # Stop loss distance = ATR * this value
+REWARD_RISK_RATIO: float = float(os.getenv("REWARD_RISK_RATIO", "2.5"))
+    # Take profit = stop distance * this ratio (2.5 = 2.5:1 R:R)
+
+# Loop timing
+LOOP_INTERVAL_SECONDS: int = 3600  # 1 hour — matches 1h candle
+HEALTH_LOG_INTERVAL: int = 4       # heartbeat every ~4 hours
 
 # ─────────────────────────────────────────────
 # Telegram
@@ -46,43 +68,29 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 # ─────────────────────────────────────────────
 # Bot behaviour
 # ─────────────────────────────────────────────
-# DRY_RUN=true  → simulate signals, log everything, NO real orders sent
-# DRY_RUN=false → live trading, real orders executed on Hyperliquid
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
-
-# Path to persist position state across restarts (used when Upstash is not configured)
 STATE_FILE: str = os.getenv("STATE_FILE", "position_state.json")
 
 # ─────────────────────────────────────────────
-# Upstash Redis (optional — for persistent state on Railway)
+# Upstash Redis (optional — for Railway persistence)
 # ─────────────────────────────────────────────
-# When both vars are set the bot stores position state in Upstash Redis so
-# that state survives Railway restarts and redeploys.  If either var is
-# absent the bot falls back to the local STATE_FILE JSON file.
-#
-# Get these values from your Upstash console at https://console.upstash.com
-# after creating a Redis database (free tier is sufficient).
 UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# Exponential backoff settings for API retries
+# Exponential backoff settings
 RETRY_MAX_ATTEMPTS: int = 5
-RETRY_BASE_DELAY: float = 2.0      # seconds
-RETRY_MAX_DELAY: float = 60.0     # seconds
+RETRY_BASE_DELAY: float = 2.0
+RETRY_MAX_DELAY: float = 60.0
 
 
 def validate():
-    """
-    Validate critical config at startup and raise early if anything is missing.
-    Called once from bot.py before the main loop starts.
-    """
+    """Validate critical config at startup."""
     errors = []
 
     if not DRY_RUN:
         if not LITE_AGENT_API_KEY:
             errors.append("LITE_AGENT_API_KEY is required when DRY_RUN=false")
 
-    # Telegram is optional — bot runs without alerts if not configured
     if TELEGRAM_BOT_TOKEN and not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID is required when TELEGRAM_BOT_TOKEN is set")
 
@@ -91,6 +99,12 @@ def validate():
 
     if POSITION_SIZE_USD < 10:
         errors.append(f"POSITION_SIZE_USD seems dangerously low: {POSITION_SIZE_USD}")
+
+    if BREAKOUT_LOOKBACK < 4 or BREAKOUT_LOOKBACK > 100:
+        errors.append(f"BREAKOUT_LOOKBACK should be 4-100, got {BREAKOUT_LOOKBACK}")
+
+    if REWARD_RISK_RATIO < 1.0:
+        errors.append(f"REWARD_RISK_RATIO must be >= 1.0, got {REWARD_RISK_RATIO}")
 
     if errors:
         raise EnvironmentError(
