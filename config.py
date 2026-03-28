@@ -23,7 +23,7 @@ HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
 SYMBOL: str = os.getenv("SYMBOL", "SOL")
 
 # Leverage to use when opening positions
-LEVERAGE: int = int(os.getenv("LEVERAGE", "10"))
+LEVERAGE: int = int(os.getenv("LEVERAGE", "15"))
 
 # Notional size of each trade in USD
 POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "50"))
