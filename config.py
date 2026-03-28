@@ -57,7 +57,7 @@ REWARD_RISK_RATIO: float = float(os.getenv("REWARD_RISK_RATIO", "2.5"))
 
 # Loop timing
 LOOP_INTERVAL_SECONDS: int = 3600  # 1 hour — matches 1h candle
-HEALTH_LOG_INTERVAL: int = 4       # heartbeat every ~4 hours
+HEALTH_LOG_INTERVAL: int = 1       # heartbeat every loop (~1 hour)
 
 # ─────────────────────────────────────────────
 # Telegram
