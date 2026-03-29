@@ -206,13 +206,18 @@ class TradingBot:
     
     def run_once(self):
         """Single bot iteration"""
-        # Check if weekday
+        # Check if weekday (Monday=0 to Friday=4)
         if not self.is_weekday():
+            # Silently skip on weekends
             return
         
         # Check existing position
         if self.position:
             self.check_position()
+            return
+        
+        # Double-check weekday before opening new positions
+        if not self.is_weekday():
             return
         
         # Fetch candles
