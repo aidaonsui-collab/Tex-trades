@@ -115,17 +115,16 @@ class TradingBot:
         
         # Use ACP perp_trade offering
         try:
-            # Format for ACP
+            # Format for ACP - size must be in USD (string format)
             payload = {
                 'offering': 'perp_trade',
                 'parameters': {
                     'action': 'open',
-                    'symbol': self.symbol,
+                    'pair': self.symbol,  # Changed from 'symbol' to 'pair'
                     'side': side.lower(),
-                    'size_usd': config.POSITION_SIZE_USD,
-                    'leverage': config.LEVERAGE,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit
+                    'size': str(config.POSITION_SIZE_USD),  # Changed from size_usd, must be string
+                    'leverage': config.LEVERAGE
+                    # Note: stop_loss/take_profit not supported by perp_trade offering
                 }
             }
             
