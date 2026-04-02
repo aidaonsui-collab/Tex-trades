@@ -21,7 +21,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -55,9 +55,8 @@ class WeeklyTracker:
     def _current_week_start() -> datetime:
         now = datetime.now(timezone.utc)
         # Week starts Monday 00:00 UTC
-        days_since_monday = now.weekday()
-        monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        monday = monday.replace(day=monday.day - days_since_monday)
+        monday = now - timedelta(days=now.weekday())
+        monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
         return monday
 
     def check_reset(self) -> Optional[dict]:
