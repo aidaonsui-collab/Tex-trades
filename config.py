@@ -35,17 +35,17 @@ CANDLE_INTERVAL: str = os.getenv("CANDLE_INTERVAL", "1h")
 CANDLE_LOOKBACK: int = 100         # candles to fetch each cycle
 
 # Breakout detection
-BREAKOUT_LOOKBACK: int = int(os.getenv("BREAKOUT_LOOKBACK", "12"))
+BREAKOUT_LOOKBACK: int = int(os.getenv("BREAKOUT_LOOKBACK", "6"))
     # Break above/below this many bars' high/low
 
-ROC_THRESHOLD: float = float(os.getenv("ROC_THRESHOLD", "1.0"))
+ROC_THRESHOLD: float = float(os.getenv("ROC_THRESHOLD", "0.75"))
     # Rate of change (%) must exceed this for momentum confirmation
 
 VOLUME_MULTIPLIER: float = float(os.getenv("VOLUME_MULTIPLIER", "1.0"))
     # Volume must be above SMA(20) * this multiplier
 
 # Trend filter
-TREND_EMA_PERIOD: int = int(os.getenv("TREND_EMA_PERIOD", "50"))
+TREND_EMA_PERIOD: int = int(os.getenv("TREND_EMA_PERIOD", "20"))
     # Only long above EMA, only short below EMA
 
 # Risk management — ATR-based stops
