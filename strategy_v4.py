@@ -16,7 +16,6 @@ Exit:
 
 import logging
 import math
-import numpy as np
 from typing import Literal, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
