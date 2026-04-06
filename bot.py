@@ -119,6 +119,7 @@ class WeeklyTracker:
 
 class RedisState:
     KEY = "mombreak_bot:position"
+    HISTORY_KEY = "mombreak_bot:trade_history"
 
     def __init__(self, url: str, token: str):
         self.base_url = url.rstrip("/")
@@ -138,6 +139,30 @@ class RedisState:
             raw = self._exec("GET", self.KEY)
             return json.loads(raw) if raw else None
         except Exception as e: logger.warning("Redis load failed: %s", e); return None
+
+    def append_trade(self, trade: dict) -> bool:
+        """Append a completed trade to persistent history."""
+        try:
+            raw = self._exec("GET", self.HISTORY_KEY)
+            history = json.loads(raw) if raw else []
+            history.append(trade)
+            # Keep last 500 trades
+            if len(history) > 500:
+                history = history[-500:]
+            self._exec("SET", self.HISTORY_KEY, json.dumps(history))
+            return True
+        except Exception as e:
+            logger.warning("Redis trade history save failed: %s", e)
+            return False
+
+    def load_history(self) -> list:
+        """Load full trade history."""
+        try:
+            raw = self._exec("GET", self.HISTORY_KEY)
+            return json.loads(raw) if raw else []
+        except Exception as e:
+            logger.warning("Redis trade history load failed: %s", e)
+            return []
 
 
 class PositionState:
@@ -307,6 +332,25 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
 
     state.close()
     tracker.add_trade(pnl, snapshot["side"], exit_reason)
+
+    # Persist trade to Redis history for dashboard
+    if state._redis:
+        trade_record = {
+            "id": f"{int(time.time())}_{snapshot['side'][:1]}",
+            "symbol": config.SYMBOL,
+            "side": snapshot["side"],
+            "entry": entry,
+            "exit": exit_price,
+            "size": size,
+            "leverage": config.LEVERAGE,
+            "pnl": round(pnl, 4),
+            "roi": round(((exit_price - entry) / entry * 100) if snapshot["side"] == "LONG"
+                         else ((entry - exit_price) / entry * 100), 4),
+            "reason": exit_reason,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "entry_time": snapshot.get("entry_time", 0),
+        }
+        state._redis.append_trade(trade_record)
 
     telegram.send_position_closed(
         snapshot["side"], entry, exit_price, size, pnl,
