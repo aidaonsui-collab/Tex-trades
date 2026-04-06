@@ -1,0 +1,455 @@
+"""
+bot_v4.py — Stochastic+MACD Trading Bot for DegenClaw
+
+Architecture:
+  - Runs every LOOP_INTERVAL (1h for 1h candles)
+  - Fetches candles from Hyperliquid
+  - If flat: check for StochK cross + MACD confirmation → enter
+  - If in position: check TP/SL on latest candle → exit
+  - No signal-flip exits (hold until TP or SL)
+  - Trade history persisted to Redis for dashboard
+  - Telegram alerts for signals, orders, closes, heartbeat, weekly summary
+"""
+
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import requests
+
+import config_v4 as config
+import exchange
+import strategy_v4 as strategy
+import telegram
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("bot_v4")
+
+_shutdown_requested = False
+
+
+def _handle_signal(signum, frame):
+    global _shutdown_requested
+    logger.info("Shutdown signal received")
+    _shutdown_requested = True
+
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
+
+
+# ─────────────────────────────────────────────
+# Weekly tracker (same as bot.py)
+# ─────────────────────────────────────────────
+
+class WeeklyTracker:
+    def __init__(self):
+        self.trades: list[dict] = []
+        self.week_start = self._current_week_start()
+
+    @staticmethod
+    def _current_week_start() -> datetime:
+        now = datetime.now(timezone.utc)
+        monday = now - timedelta(days=now.weekday())
+        return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def check_reset(self) -> Optional[dict]:
+        current_week = self._current_week_start()
+        if current_week > self.week_start and self.trades:
+            summary = self.get_summary()
+            self.trades = []
+            self.week_start = current_week
+            return summary
+        elif current_week > self.week_start:
+            self.week_start = current_week
+        return None
+
+    def add_trade(self, pnl: float, side: str, reason: str):
+        self.trades.append({"pnl": pnl, "side": side, "reason": reason,
+                            "ts": datetime.now(timezone.utc).isoformat()})
+
+    @property
+    def total_pnl(self) -> float:
+        return sum(t["pnl"] for t in self.trades)
+
+    @property
+    def total_trades(self) -> int:
+        return len(self.trades)
+
+    @property
+    def wins(self) -> int:
+        return sum(1 for t in self.trades if t["pnl"] > 0)
+
+    def get_summary(self) -> dict:
+        if not self.trades:
+            return {"trades": 0, "wins": 0, "pnl": 0, "sortino": 0, "pf": 0,
+                    "best": 0, "worst": 0}
+        wins = [t for t in self.trades if t["pnl"] > 0]
+        losses = [t for t in self.trades if t["pnl"] <= 0]
+        pnls = [t["pnl"] for t in self.trades]
+        gw = sum(t["pnl"] for t in wins) if wins else 0
+        gl = abs(sum(t["pnl"] for t in losses)) if losses else 0.01
+        pf = gw / gl if gl > 0 else 10.0
+        rets = [p / config.POSITION_SIZE_USD for p in pnls]
+        mean_r = sum(rets) / len(rets)
+        downside = [min(0, r) ** 2 for r in rets]
+        dd = math.sqrt(sum(downside) / len(downside))
+        sortino = mean_r / dd if dd > 0 else (10.0 if mean_r > 0 else 0)
+        return {"trades": len(self.trades), "wins": len(wins), "pnl": self.total_pnl,
+                "sortino": sortino, "pf": pf, "best": max(pnls), "worst": min(pnls)}
+
+
+# ─────────────────────────────────────────────
+# Redis state (same as bot.py)
+# ─────────────────────────────────────────────
+
+class RedisState:
+    KEY = "stochmacd_bot:position"
+    HISTORY_KEY = "stochmacd_bot:trade_history"
+
+    def __init__(self, url: str, token: str):
+        self.base_url = url.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    def _exec(self, *args):
+        resp = requests.post(self.base_url, headers=self.headers, json=list(args), timeout=5)
+        resp.raise_for_status()
+        return resp.json().get("result")
+
+    def save(self, data: dict) -> bool:
+        try: self._exec("SET", self.KEY, json.dumps(data)); return True
+        except Exception as e: logger.warning("Redis save failed: %s", e); return False
+
+    def load(self) -> Optional[dict]:
+        try:
+            raw = self._exec("GET", self.KEY)
+            return json.loads(raw) if raw else None
+        except Exception as e: logger.warning("Redis load failed: %s", e); return None
+
+    def append_trade(self, trade: dict) -> bool:
+        try:
+            raw = self._exec("GET", self.HISTORY_KEY)
+            history = json.loads(raw) if raw else []
+            history.append(trade)
+            if len(history) > 500:
+                history = history[-500:]
+            self._exec("SET", self.HISTORY_KEY, json.dumps(history))
+            return True
+        except Exception as e:
+            logger.warning("Redis trade history save failed: %s", e)
+            return False
+
+
+# ─────────────────────────────────────────────
+# Position state
+# ─────────────────────────────────────────────
+
+class PositionState:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.side: Optional[str] = None
+        self.size: float = 0.0
+        self.entry_price: float = 0.0
+        self.entry_time: float = 0.0
+
+        redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+        redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        if redis_url and redis_token:
+            self._redis: Optional[RedisState] = RedisState(redis_url, redis_token)
+            logger.info("State backend: Upstash Redis")
+        else:
+            self._redis = None
+            logger.info("State backend: local file (%s)", filepath)
+        self._load()
+
+    def is_open(self) -> bool:
+        return self.side is not None
+
+    def open(self, side: str, size: float, price: float) -> None:
+        self.side = side
+        self.size = size
+        self.entry_price = price
+        self.entry_time = time.time()
+        self._save()
+
+    def close(self) -> dict:
+        snapshot = {"side": self.side, "size": self.size,
+                    "entry_price": self.entry_price, "entry_time": self.entry_time}
+        self.side = None
+        self.size = 0.0
+        self.entry_price = 0.0
+        self.entry_time = 0.0
+        self._save()
+        return snapshot
+
+    def _current_data(self) -> dict:
+        return {"side": self.side, "size": self.size, "entry_price": self.entry_price,
+                "entry_time": self.entry_time}
+
+    def _save(self):
+        data = self._current_data()
+        if self._redis and not self._redis.save(data):
+            self._save_file(data)
+        elif not self._redis:
+            self._save_file(data)
+
+    def _save_file(self, data):
+        try:
+            with open(self.filepath, "w") as f: json.dump(data, f, indent=2)
+        except OSError as e: logger.warning("File save failed: %s", e)
+
+    def _load(self):
+        data = None
+        if self._redis:
+            data = self._redis.load()
+        if not data:
+            data = self._load_file()
+        if data:
+            self.side = data.get("side")
+            self.size = float(data.get("size", 0))
+            self.entry_price = float(data.get("entry_price", 0))
+            self.entry_time = float(data.get("entry_time", 0))
+            if self.side:
+                logger.info("Restored: %s %.4f @ $%.2f", self.side, self.size, self.entry_price)
+
+    def _load_file(self) -> Optional[dict]:
+        if not os.path.exists(self.filepath):
+            return None
+        try:
+            with open(self.filepath) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+
+# ─────────────────────────────────────────────
+# Candle fetching
+# ─────────────────────────────────────────────
+
+def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[dict]:
+    interval_ms = {"15m": 15, "30m": 30, "1h": 60, "4h": 240}
+    mins = interval_ms.get(interval, 60)
+    now = int(time.time() * 1000)
+    start = now - (limit * mins * 60 * 1000)
+
+    resp = requests.post(f"{config.HYPERLIQUID_API_URL}/info", json={
+        "type": "candleSnapshot",
+        "req": {"coin": symbol, "interval": interval, "startTime": start, "endTime": now}
+    }, timeout=15)
+    resp.raise_for_status()
+    raw = resp.json()
+
+    candles = []
+    for c in raw:
+        candles.append({
+            "timestamp": int(c["t"]),
+            "open": float(c["o"]),
+            "high": float(c["h"]),
+            "low": float(c["l"]),
+            "close": float(c["c"]),
+            "volume": float(c["v"]),
+        })
+    return candles
+
+
+# ─────────────────────────────────────────────
+# Entry / Exit handlers
+# ─────────────────────────────────────────────
+
+def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
+    sig = result["signal"]
+    price = result["price"]
+
+    size = strategy.calculate_size(price, config.POSITION_SIZE_USD, config.LEVERAGE)
+    if size <= 0:
+        logger.error("Zero size (price=%.2f)", price)
+        return
+
+    logger.info("Entry: %s price=$%.2f size=%.4f StochK=%.1f MACD=%.3f RSI=%.1f",
+                sig, price, size, result["stoch_k"], result["macd"], result["rsi"])
+
+    tp_price = price * (1 + config.TP_PERCENT / 100) if sig == "LONG" else price * (1 - config.TP_PERCENT / 100)
+    sl_price = price * (1 - config.SL_PERCENT / 100) if sig == "LONG" else price * (1 + config.SL_PERCENT / 100)
+
+    telegram.send_signal(
+        sig, price, 0, 0, 0, 0, "",
+        0, 0,
+    )
+
+    if not config.DRY_RUN:
+        try:
+            exchange.set_leverage(config.SYMBOL, config.LEVERAGE)
+            order_side = "buy" if sig == "LONG" else "sell"
+            exchange.place_market_order(config.SYMBOL, order_side, size)
+        except Exception as exc:
+            logger.error("Order failed: %s", exc)
+            telegram.send_error("place_market_order failed", exc)
+            return
+
+    state.open(sig, size, price)
+    telegram.send_order_placed(sig, size, price, config.LEVERAGE, 0, dry_run=config.DRY_RUN)
+
+
+def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
+                tracker: WeeklyTracker) -> None:
+    snapshot = state.close()
+
+    if snapshot["side"] == "LONG":
+        pnl = ((exit_price - snapshot["entry_price"]) / snapshot["entry_price"]) * snapshot["size"] * config.LEVERAGE * snapshot["entry_price"]
+    else:
+        pnl = ((snapshot["entry_price"] - exit_price) / snapshot["entry_price"]) * snapshot["size"] * config.LEVERAGE * snapshot["entry_price"]
+
+    logger.info("Exit: %s @ $%.2f (entry $%.2f) reason=%s pnl=$%.2f",
+                snapshot["side"], exit_price, snapshot["entry_price"], exit_reason, pnl)
+
+    if not config.DRY_RUN:
+        try:
+            exchange.close_position(config.SYMBOL, snapshot["side"], snapshot["size"])
+        except Exception as exc:
+            logger.error("Close failed: %s", exc)
+            telegram.send_error("close_position failed", exc)
+            return
+
+    tracker.add_trade(pnl, snapshot["side"], exit_reason)
+
+    if state._redis:
+        trade_record = {
+            "id": f"{int(time.time())}_{snapshot['side'][:1]}",
+            "symbol": config.SYMBOL,
+            "side": snapshot["side"],
+            "entry": snapshot["entry_price"],
+            "exit": exit_price,
+            "size": snapshot["size"],
+            "leverage": config.LEVERAGE,
+            "pnl": round(pnl, 4),
+            "roi": round(((exit_price - snapshot["entry_price"]) / snapshot["entry_price"] * 100)
+                         if snapshot["side"] == "LONG"
+                         else ((snapshot["entry_price"] - exit_price) / snapshot["entry_price"] * 100), 4),
+            "reason": exit_reason,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        state._redis.append_trade(trade_record)
+
+    telegram.send_position_closed(
+        snapshot["side"], snapshot["entry_price"], exit_price, snapshot["size"], pnl,
+        exit_reason=exit_reason,
+        weekly_pnl=tracker.total_pnl,
+        weekly_trades=tracker.total_trades,
+        weekly_wins=tracker.wins,
+        dry_run=config.DRY_RUN,
+    )
+
+
+# ─────────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────────
+
+def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list) -> Optional[dict]:
+    summary = tracker.check_reset()
+    if summary and summary["trades"] > 0:
+        telegram.send_weekly_summary(
+            summary["trades"], summary["wins"], summary["pnl"],
+            summary["sortino"], summary["pf"],
+            summary["best"], summary["worst"],
+        )
+
+    result = strategy.compute_signal(
+        candles,
+        k_period=config.STOCH_K_PERIOD,
+        d_period=config.STOCH_D_PERIOD,
+        macd_fast=config.MACD_FAST,
+        macd_slow=config.MACD_SLOW,
+        macd_sig_period=config.MACD_SIGNAL,
+        rsi_period=config.RSI_PERIOD,
+        rsi_threshold=config.RSI_SHORT_THRESHOLD,
+    )
+
+    logger.info("Signal=%s price=$%.2f StochK=%.1f/D=%.1f MACD=%.3f hist=%.3f RSI=%.1f pos=%s",
+                result["signal"], result["price"],
+                result["stoch_k"], result["stoch_d"],
+                result["macd"], result["macd_hist"], result["rsi"],
+                state.side or "FLAT")
+
+    if state.is_open():
+        latest = candles[-1]
+        should_exit, reason, exit_price = strategy.check_exit(
+            latest, state.side, state.entry_price,
+            tp_pct=config.TP_PERCENT, sl_pct=config.SL_PERCENT,
+        )
+        if should_exit:
+            handle_exit(exit_price, reason, state, tracker)
+    else:
+        if result["signal"] in ("LONG", "SHORT"):
+            handle_entry(result, state, tracker)
+
+    return result
+
+
+def main() -> None:
+    logger.info("=" * 60)
+    logger.info("Stoch+MACD Bot v4 starting")
+    logger.info("Symbol=%s  Interval=%s  Leverage=%dx  Size=$%.0f  DryRun=%s",
+                config.SYMBOL, config.CANDLE_INTERVAL, config.LEVERAGE,
+                config.POSITION_SIZE_USD, config.DRY_RUN)
+    logger.info("TP=%.1f%%  SL=%.1f%%  StochK=%d  MACD=%d/%d/%d  RSI<%d",
+                config.TP_PERCENT, config.SL_PERCENT,
+                config.STOCH_K_PERIOD, config.MACD_FAST, config.MACD_SLOW, config.MACD_SIGNAL,
+                int(config.RSI_SHORT_THRESHOLD))
+    logger.info("=" * 60)
+
+    config.validate()
+
+    state = PositionState(config.STATE_FILE)
+    tracker = WeeklyTracker()
+
+    loop_count = 0
+    start_time = time.time()
+
+    while not _shutdown_requested:
+        loop_count += 1
+
+        try:
+            candles = fetch_candles(config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK)
+            if len(candles) < 30:
+                logger.warning("Only %d candles fetched, skipping", len(candles))
+            else:
+                run_loop(state, tracker, candles)
+        except Exception as exc:
+            logger.error("Loop error: %s", exc, exc_info=True)
+            telegram.send_error("loop_error", exc)
+
+        # Heartbeat
+        if loop_count % config.HEALTH_LOG_INTERVAL == 0:
+            uptime = (time.time() - start_time) / 3600
+            if state.is_open():
+                telegram.send_health(
+                    loop_count, uptime,
+                    position_side=state.side,
+                    entry_price=state.entry_price,
+                    weekly_pnl=tracker.total_pnl,
+                    weekly_trades=tracker.total_trades,
+                )
+            else:
+                telegram.send_health(loop_count, uptime)
+
+        if _shutdown_requested:
+            break
+
+        time.sleep(config.LOOP_INTERVAL_SECONDS)
+
+    logger.info("Bot stopped after %d loops", loop_count)
+
+
+if __name__ == "__main__":
+    main()
