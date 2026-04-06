@@ -419,27 +419,82 @@ def main() -> None:
     while not _shutdown_requested:
         loop_count += 1
 
+        last_result = None
         try:
             candles = fetch_candles(config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK)
             if len(candles) < 30:
                 logger.warning("Only %d candles fetched, skipping", len(candles))
             else:
-                run_loop(state, tracker, candles)
+                last_result = run_loop(state, tracker, candles)
         except Exception as exc:
             logger.error("Loop error: %s", exc, exc_info=True)
             telegram.send_error("loop_error", exc)
 
-        # Heartbeat
+        # Heartbeat with indicator values
         if loop_count % config.HEALTH_LOG_INTERVAL == 0:
             uptime = (time.time() - start_time) / 3600
-            if state.is_open():
-                telegram.send_health(
-                    loop_count, uptime,
-                    position_side=state.side,
-                    entry_price=state.entry_price,
-                    weekly_pnl=tracker.total_pnl,
-                    weekly_trades=tracker.total_trades,
+            if state.is_open() and last_result:
+                # Calculate uPnL
+                current_price = last_result["price"]
+                if state.side == "LONG":
+                    upnl = ((current_price - state.entry_price) / state.entry_price) * 100
+                    tp_price = state.entry_price * (1 + config.TP_PERCENT / 100)
+                    sl_price = state.entry_price * (1 - config.SL_PERCENT / 100)
+                else:
+                    upnl = ((state.entry_price - current_price) / state.entry_price) * 100
+                    tp_price = state.entry_price * (1 - config.TP_PERCENT / 100)
+                    sl_price = state.entry_price * (1 + config.SL_PERCENT / 100)
+
+                dist_tp = abs(current_price - tp_price) / current_price * 100
+                dist_sl = abs(current_price - sl_price) / current_price * 100
+
+                msg = (
+                    f"💓 Heartbeat 🔴 {'DRY RUN' if config.DRY_RUN else 'LIVE'}\n\n"
+                    f"Symbol: {config.SYMBOL}\n"
+                    f"Price: ${current_price:.2f}\n"
+                    f"Position: {state.side} @ ${state.entry_price:.2f}\n"
+                    f"uPnL: {upnl:+.2f}%\n"
+                    f"TP: ${tp_price:.2f} ({dist_tp:.2f}% away)\n"
+                    f"SL: ${sl_price:.2f} ({dist_sl:.2f}% away)\n\n"
+                    f"📊 Indicators\n"
+                    f"StochK: {last_result['stoch_k']:.1f} / D: {last_result['stoch_d']:.1f}\n"
+                    f"MACD: {last_result['macd']:.3f} | Hist: {last_result['macd_hist']:.3f}\n"
+                    f"RSI: {last_result['rsi']:.1f}\n\n"
+                    f"📈 Week: {tracker.total_trades} trades | ${tracker.total_pnl:+.2f}\n"
+                    f"Loops: {loop_count} | Uptime: {uptime:.1f}h"
                 )
+                telegram._send(msg)
+            elif last_result:
+                # Flat — show how close we are to a signal
+                k = last_result["stoch_k"]
+                d = last_result["stoch_d"]
+                k_above_d = k > d
+                macd = last_result["macd"]
+                hist = last_result["macd_hist"]
+                rsi_val = last_result["rsi"]
+
+                long_ready = "✅" if macd > 0 and hist > 0 else "❌"
+                short_ready = "✅" if macd < 0 and rsi_val < 50 else "❌"
+                cross_status = "K > D (watching for cross DOWN)" if k_above_d else "K < D (watching for cross UP)"
+
+                msg = (
+                    f"💓 Heartbeat {'🟡 DRY RUN' if config.DRY_RUN else '🔴 LIVE'}\n\n"
+                    f"Symbol: {config.SYMBOL}\n"
+                    f"Price: ${last_result['price']:.2f}\n"
+                    f"Position: FLAT\n\n"
+                    f"📊 Indicators\n"
+                    f"StochK: {k:.1f} / D: {d:.1f}\n"
+                    f"Stoch: {cross_status}\n"
+                    f"MACD: {macd:.3f} | Hist: {hist:.3f}\n"
+                    f"RSI: {rsi_val:.1f}\n\n"
+                    f"🎯 Signal readiness\n"
+                    f"{long_ready} LONG: MACD>0 & hist>0\n"
+                    f"{short_ready} SHORT: MACD<0 & RSI<50\n"
+                    f"⏳ Waiting for StochK/D cross...\n\n"
+                    f"📈 Week: {tracker.total_trades} trades | ${tracker.total_pnl:+.2f}\n"
+                    f"Loops: {loop_count} | Uptime: {uptime:.1f}h"
+                )
+                telegram._send(msg)
             else:
                 telegram.send_health(loop_count, uptime)
 
