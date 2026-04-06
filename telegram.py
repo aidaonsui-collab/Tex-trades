@@ -46,6 +46,10 @@ def _send(text: str, parse_mode: str = "HTML") -> bool:
         return False
 
 
+def send_telegram(text: str) -> bool:
+    """Send a raw text message to Telegram."""
+    return _send(text, parse_mode="HTML")
+
 def _escape(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
