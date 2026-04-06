@@ -30,7 +30,7 @@ HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
 # ─────────────────────────────────────────────
 SYMBOL: str = os.getenv("SYMBOL", "SOL")
 CANDLE_INTERVAL: str = os.getenv("CANDLE_INTERVAL", "1h")
-LEVERAGE: int = int(os.getenv("LEVERAGE", "1"))  # No leverage for this strategy
+LEVERAGE: int = int(os.getenv("LEVERAGE", "10"))
 POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "100"))
 
 # ─────────────────────────────────────────────
