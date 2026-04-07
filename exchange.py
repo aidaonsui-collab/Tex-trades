@@ -312,6 +312,63 @@ def close_position(symbol: str, side: str, size: float) -> dict:
     return place_market_order(symbol, close_side, size, reduce_only=True)
 
 
+def set_tp_sl(symbol: str, take_profit: float, stop_loss: float) -> dict:
+    """
+    Set TP/SL on an open position via the DegenClaw perp_modify offering.
+    This places native TP/SL orders on Hyperliquid — they execute instantly
+    when price hits the level, no polling needed.
+    """
+    label = f"{'[DRY RUN] ' if config.DRY_RUN else '[ACP] '}set_tp_sl"
+    logger.info("%s: %s TP=$%.2f SL=$%.2f", label, symbol, take_profit, stop_loss)
+
+    if config.DRY_RUN:
+        return {"status": "ok", "dry_run": True, "tp": take_profit, "sl": stop_loss}
+
+    requirements = {
+        "pair": symbol,
+        "takeProfit": str(take_profit),
+        "stopLoss": str(stop_loss),
+    }
+
+    # Use perp_modify offering (different from perp_trade)
+    body = {
+        "providerWalletAddress": DGCLAW_PROVIDER,
+        "jobOfferingName": "perp_modify",
+        "serviceRequirements": requirements,
+        "isAutomated": True,
+    }
+    logger.info("[ACP] Submitting perp_modify: %s", json.dumps(requirements))
+
+    def _create():
+        return _acp_post("/acp/jobs", body)
+
+    result = _with_backoff(_create, label="acp_perp_modify")
+    job_id = (result.get("data") or {}).get("jobId") or result.get("jobId")
+    if not job_id:
+        raise RuntimeError(f"perp_modify job create returned no jobId: {result}")
+    logger.info("[ACP] perp_modify job created: id=%s", job_id)
+
+    # Poll for completion
+    deadline = time.time() + JOB_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(JOB_POLL_INTERVAL)
+        status_resp = _acp_get(f"/acp/jobs/{job_id}")
+        job = (status_resp.get("data") or {})
+        phase = job.get("phase", "UNKNOWN")
+        if phase in ("COMPLETED", "DELIVERED", "DONE"):
+            logger.info("[ACP] perp_modify completed: TP=$%.2f SL=$%.2f", take_profit, stop_loss)
+            return {"status": "ok", "acp_job": job}
+        if phase in ("FAILED", "CANCELLED", "REJECTED", "EXPIRED"):
+            raise RuntimeError(f"perp_modify job {job_id} failed: phase={phase}")
+        if phase == "PENDING_PAYMENT":
+            try:
+                _acp_post(f"/acp/providers/jobs/{job_id}/negotiation",
+                          {"accept": True, "content": "auto-approved"})
+            except Exception:
+                pass
+    raise TimeoutError(f"perp_modify job {job_id} timed out")
+
+
 def get_open_position(symbol: str) -> Optional[dict]:
     """
     Query the exchange for any currently open position.

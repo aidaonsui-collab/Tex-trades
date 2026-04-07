@@ -23,7 +23,9 @@ from typing import Optional
 
 import requests
 
+import sys
 import config_v4 as config
+sys.modules['config'] = config  # ensure exchange.py uses config_v4
 import exchange
 import strategy_v4 as strategy
 import telegram
@@ -334,6 +336,13 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
             logger.error("Order failed: %s", exc)
             telegram.send_error("place_market_order failed", exc)
             return
+
+        # Set native TP/SL on Hyperliquid via perp_modify
+        try:
+            exchange.set_tp_sl(config.SYMBOL, tp_price, sl_price)
+            logger.info("Native TP/SL set: TP=$%.2f SL=$%.2f", tp_price, sl_price)
+        except Exception as exc:
+            logger.warning("perp_modify TP/SL failed (non-fatal, using software TP/SL): %s", exc)
 
     state.open(sig, size, price)
     telegram.send_order_placed(sig, size, price, config.LEVERAGE, 0, dry_run=config.DRY_RUN)
