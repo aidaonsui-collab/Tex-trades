@@ -282,10 +282,30 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
     tp_price = price * (1 + config.TP_PERCENT / 100) if sig == "LONG" else price * (1 - config.TP_PERCENT / 100)
     sl_price = price * (1 - config.SL_PERCENT / 100) if sig == "LONG" else price * (1 + config.SL_PERCENT / 100)
 
-    telegram.send_signal(
-        sig, price, 0, 0, 0, 0, "",
-        0, 0,
+    # Custom signal alert for composite strategy
+    emoji = "🟢" if sig == "LONG" else "🔴"
+    score = result.get("score", 0)
+    gate = result.get("gate_count", 0)
+    htf = result.get("htf_bias", 0)
+    htf_str = "▲▲" if htf>=2 else "▲" if htf==1 else "▼▼" if htf<=-2 else "▼" if htf==-1 else "—"
+    star = "⭐" if score >= 4.5 else ""
+
+    msg = (
+        f"{emoji} <b>{'LONG' if sig=='LONG' else 'SHORT'}</b> Signal {star} {'🟡 DRY' if config.DRY_RUN else '🔴 LIVE'}\n\n"
+        f"Symbol: <code>{config.SYMBOL}</code>\n"
+        f"Price: <code>${price:,.2f}</code>\n\n"
+        f"📊 <b>Composite Score: {score:.2f}</b>\n"
+        f"Gate: {gate}/5 ✅\n"
+        f"4H Bias: {htf_str} ({htf})\n"
+        f"StochK: {result['stoch_k']:.1f} / D: {result['stoch_d']:.1f}\n"
+        f"MACD: {result['macd']:.3f} | Hist: {result['macd_hist']:.3f}\n"
+        f"RSI: {result['rsi']:.1f}\n\n"
+        f"🎯 <b>Levels</b>\n"
+        f"TP: <code>${tp_price:,.2f}</code> (+{config.TP_PERCENT}%)\n"
+        f"SL: <code>${sl_price:,.2f}</code> (-{config.SL_PERCENT}%)\n"
+        f"Size: <code>{size:.4f}</code> @ {config.LEVERAGE}x"
     )
+    telegram._send(msg)
 
     if not config.DRY_RUN:
         try:
