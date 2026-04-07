@@ -263,6 +263,24 @@ def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[dict]:
     return candles
 
 
+def _get_current_price(symbol: str) -> float:
+    """Quick price fetch using latest 1m candle."""
+    try:
+        now = int(time.time() * 1000)
+        start = now - (5 * 60 * 1000)
+        resp = requests.post(f"{config.HYPERLIQUID_API_URL}/info", json={
+            "type": "candleSnapshot",
+            "req": {"coin": symbol, "interval": "1m", "startTime": start, "endTime": now}
+        }, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+        if raw:
+            return float(raw[-1]["c"])
+    except Exception:
+        pass
+    return 0.0
+
+
 # ─────────────────────────────────────────────
 # Entry / Exit handlers
 # ─────────────────────────────────────────────
@@ -525,7 +543,41 @@ def main() -> None:
         if _shutdown_requested:
             break
 
-        time.sleep(config.LOOP_INTERVAL_SECONDS)
+        # Fast TP/SL check: while in position, check price every 5 min
+        # instead of waiting for the full hourly loop
+        if state.is_open():
+            check_interval = 300  # 5 minutes
+            checks_per_loop = config.LOOP_INTERVAL_SECONDS // check_interval
+            for _ in range(checks_per_loop):
+                if _shutdown_requested or not state.is_open():
+                    break
+                time.sleep(check_interval)
+                try:
+                    price_now = _get_current_price(config.SYMBOL)
+                    if price_now <= 0:
+                        continue
+                    # Build a synthetic candle with current price as high/low
+                    fake_candle = {"high": price_now, "low": price_now, "close": price_now,
+                                   "open": price_now, "volume": 0, "timestamp": 0}
+                    should_exit, reason, exit_price = strategy.check_exit(
+                        fake_candle, state.side, state.entry_price,
+                        tp_pct=config.TP_PERCENT, sl_pct=config.SL_PERCENT,
+                    )
+                    if should_exit:
+                        logger.info("Fast TP/SL check: %s at $%.2f", reason, price_now)
+                        handle_exit(exit_price, reason, state, tracker)
+                        break
+                    else:
+                        ep = state.entry_price
+                        if state.side == "LONG":
+                            upnl_pct = (price_now - ep) / ep * 100
+                        else:
+                            upnl_pct = (ep - price_now) / ep * 100
+                        logger.debug("Price check: $%.2f uPnL=%.2f%%", price_now, upnl_pct)
+                except Exception as exc:
+                    logger.warning("Fast price check error: %s", exc)
+        else:
+            time.sleep(config.LOOP_INTERVAL_SECONDS)
 
     logger.info("Bot stopped after %d loops", loop_count)
 
