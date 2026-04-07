@@ -37,7 +37,7 @@ POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "100"))
 # Stoch+MACD Strategy Parameters
 # ─────────────────────────────────────────────
 TP_PERCENT: float = float(os.getenv("TP_PERCENT", "1.5"))
-SL_PERCENT: float = float(os.getenv("SL_PERCENT", "1.2"))
+SL_PERCENT: float = float(os.getenv("SL_PERCENT", "1.0"))
 
 # Stochastic
 STOCH_K_PERIOD: int = int(os.getenv("STOCH_K_PERIOD", "14"))
@@ -101,3 +101,10 @@ def validate():
         errors.append(f"SL_PERCENT must be 0-5, got {SL_PERCENT}")
     if errors:
         raise EnvironmentError("Config errors:\n" + "\n".join(f"  - {e}" for e in errors))
+
+# ─────────────────────────────────────────────
+# Composite Signal Parameters
+# ─────────────────────────────────────────────
+MIN_SCORE: float = float(os.getenv("MIN_SCORE", "4.0"))
+HTF_BONUS: float = float(os.getenv("HTF_BONUS", "0.5"))
+HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "4h")

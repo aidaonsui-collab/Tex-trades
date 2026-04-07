@@ -355,7 +355,7 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
 # Main loop
 # ─────────────────────────────────────────────
 
-def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list) -> Optional[dict]:
+def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list, candles_4h: list = None) -> Optional[dict]:
     summary = tracker.check_reset()
     if summary and summary["trades"] > 0:
         telegram.send_weekly_summary(
@@ -366,19 +366,22 @@ def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list) -> Opt
 
     result = strategy.compute_signal(
         candles,
+        candles_4h=candles_4h,
+        min_score=config.MIN_SCORE,
+        htf_bonus=config.HTF_BONUS,
         k_period=config.STOCH_K_PERIOD,
         d_period=config.STOCH_D_PERIOD,
         macd_fast=config.MACD_FAST,
         macd_slow=config.MACD_SLOW,
         macd_sig_period=config.MACD_SIGNAL,
         rsi_period=config.RSI_PERIOD,
-        rsi_threshold=config.RSI_SHORT_THRESHOLD,
     )
 
-    logger.info("Signal=%s price=$%.2f StochK=%.1f/D=%.1f MACD=%.3f hist=%.3f RSI=%.1f pos=%s",
-                result["signal"], result["price"],
+    logger.info("Signal=%s price=$%.2f score=%.2f gate=%d htf=%d StochK=%.1f/D=%.1f MACD=%.3f RSI=%.1f pos=%s",
+                result["signal"], result["price"], result["score"],
+                result["gate_count"], result["htf_bias"],
                 result["stoch_k"], result["stoch_d"],
-                result["macd"], result["macd_hist"], result["rsi"],
+                result["macd"], result["rsi"],
                 state.side or "FLAT")
 
     if state.is_open():
@@ -422,10 +425,11 @@ def main() -> None:
         last_result = None
         try:
             candles = fetch_candles(config.SYMBOL, config.CANDLE_INTERVAL, config.CANDLE_LOOKBACK)
+            candles_4h = fetch_candles(config.SYMBOL, config.HTF_INTERVAL, 50)
             if len(candles) < 30:
                 logger.warning("Only %d candles fetched, skipping", len(candles))
             else:
-                last_result = run_loop(state, tracker, candles)
+                last_result = run_loop(state, tracker, candles, candles_4h)
         except Exception as exc:
             logger.error("Loop error: %s", exc, exc_info=True)
             telegram.send_error("loop_error", exc)
@@ -474,7 +478,7 @@ def main() -> None:
                 rsi_val = last_result["rsi"]
 
                 long_ready = "✅" if macd > 0 and hist > 0 else "❌"
-                short_ready = "✅" if macd < 0 and rsi_val < 50 else "❌"
+                short_ready = "✅" if macd < 0 else "❌"
                 cross_status = "K > D (watching for cross DOWN)" if k_above_d else "K < D (watching for cross UP)"
 
                 msg = (
