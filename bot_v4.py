@@ -352,10 +352,11 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
                 tracker: WeeklyTracker) -> None:
     snapshot = state.close()
 
+    # P&L = price_diff × size (size is already the leveraged quantity in SOL)
     if snapshot["side"] == "LONG":
-        pnl = ((exit_price - snapshot["entry_price"]) / snapshot["entry_price"]) * snapshot["size"] * config.LEVERAGE * snapshot["entry_price"]
+        pnl = (exit_price - snapshot["entry_price"]) * snapshot["size"]
     else:
-        pnl = ((snapshot["entry_price"] - exit_price) / snapshot["entry_price"]) * snapshot["size"] * config.LEVERAGE * snapshot["entry_price"]
+        pnl = (snapshot["entry_price"] - exit_price) * snapshot["size"]
 
     logger.info("Exit: %s @ $%.2f (entry $%.2f) reason=%s pnl=$%.2f",
                 snapshot["side"], exit_price, snapshot["entry_price"], exit_reason, pnl)
