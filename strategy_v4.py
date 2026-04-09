@@ -206,7 +206,23 @@ def compute_signal(candles, candles_4h=None, min_score=4.0, htf_bonus=0.5,
     k_cross_dn=k_now<d_now and k_prev>=d_prev
     htf_bias=compute_htf_bias(candles_4h) if candles_4h else 0
 
-    signal="NONE"; final_score=0.0; gate_count=0
+    # Regime filter: distance from 30-bar high/low
+    highs=[c["high"] for c in candles[-30:]]
+    lows=[c["low"] for c in candles[-30:]]
+    high_30=max(highs) if highs else price
+    low_30=min(lows) if lows else price
+    dist_from_high=(high_30-price)/high_30*100 if high_30>0 else 0
+    dist_from_low=(price-low_30)/low_30*100 if low_30>0 else 0
+
+    # Get filter params from kwargs
+    regime_buy_pct=kwargs.get("regime_buy_pct", 8)
+    regime_sell_pct=kwargs.get("regime_sell_pct", 5)
+    exhaust_rsi_low=kwargs.get("exhaust_rsi_low", 30)
+    exhaust_rsi_high=kwargs.get("exhaust_rsi_high", 70)
+    exhaust_stk_low=kwargs.get("exhaust_stk_low", 15)
+    exhaust_stk_high=kwargs.get("exhaust_stk_high", 85)
+
+    signal="NONE"; final_score=0.0; gate_count=0; block_reason=""
 
     if k_cross_up:
         raw=_score_long(macd_now,hist_now,hist_prev,rsi_now,vr,bb_now,is_bull,lw,cci_v[-1],mfi_v[-1],wr[-1],e8[-1],e21[-1])
@@ -214,8 +230,18 @@ def compute_signal(candles, candles_4h=None, min_score=4.0, htf_bonus=0.5,
         if gate_count>=2:
             final_score=raw+(htf_bonus if htf_bias>=2 else 0)
             if final_score>=min_score:
-                signal="LONG"
-                logger.info("LONG sc=%.2f gate=%d K=%.1f MACD=%.3f RSI=%.1f",final_score,gate_count,k_now,macd_now,rsi_now)
+                # Regime: block buys if price dropped too far from recent high
+                if dist_from_high>regime_buy_pct:
+                    block_reason=f"REGIME_BUY: {dist_from_high:.1f}%>{regime_buy_pct}% below 30-bar high"
+                    logger.info("LONG BLOCKED %s (sc=%.2f)", block_reason, final_score)
+                # Exhaustion: block buys at extreme oversold (catching falling knife)
+                elif rsi_now<exhaust_rsi_low and k_now<exhaust_stk_low:
+                    block_reason=f"EXHAUSTION: RSI={rsi_now:.0f}<{exhaust_rsi_low} & K={k_now:.0f}<{exhaust_stk_low}"
+                    logger.info("LONG BLOCKED %s (sc=%.2f)", block_reason, final_score)
+                else:
+                    signal="LONG"
+                    logger.info("LONG sc=%.2f gate=%d K=%.1f MACD=%.3f RSI=%.1f dist_high=%.1f%%",
+                                final_score,gate_count,k_now,macd_now,rsi_now,dist_from_high)
 
     elif k_cross_dn:
         raw=_score_short(macd_now,hist_now,rsi_now,vr,bb_now,is_bull,uw,cci_v[-1],mfi_v[-1],wr[-1],e8[-1],e21[-1])
@@ -223,11 +249,22 @@ def compute_signal(candles, candles_4h=None, min_score=4.0, htf_bonus=0.5,
         if gate_count>=2:
             final_score=raw+(htf_bonus if htf_bias<=-2 else 0)
             if final_score>=min_score:
-                signal="SHORT"
-                logger.info("SHORT sc=%.2f gate=%d K=%.1f MACD=%.3f RSI=%.1f",final_score,gate_count,k_now,macd_now,rsi_now)
+                # Regime: block shorts if price is too close to recent low
+                if dist_from_low<regime_sell_pct:
+                    block_reason=f"REGIME_SELL: {dist_from_low:.1f}%<{regime_sell_pct}% above 30-bar low"
+                    logger.info("SHORT BLOCKED %s (sc=%.2f)", block_reason, final_score)
+                # Exhaustion: block shorts at extreme overbought
+                elif rsi_now>exhaust_rsi_high and k_now>exhaust_stk_high:
+                    block_reason=f"EXHAUSTION: RSI={rsi_now:.0f}>{exhaust_rsi_high} & K={k_now:.0f}>{exhaust_stk_high}"
+                    logger.info("SHORT BLOCKED %s (sc=%.2f)", block_reason, final_score)
+                else:
+                    signal="SHORT"
+                    logger.info("SHORT sc=%.2f gate=%d K=%.1f MACD=%.3f RSI=%.1f dist_low=%.1f%%",
+                                final_score,gate_count,k_now,macd_now,rsi_now,dist_from_low)
 
     return {"signal":signal,"price":price,"score":final_score,"stoch_k":k_now,"stoch_d":d_now,
-            "macd":macd_now,"macd_hist":hist_now,"rsi":rsi_now,"gate_count":gate_count,"htf_bias":htf_bias}
+            "macd":macd_now,"macd_hist":hist_now,"rsi":rsi_now,"gate_count":gate_count,"htf_bias":htf_bias,
+            "block_reason":block_reason,"dist_from_high":dist_from_high,"dist_from_low":dist_from_low}
 
 def check_exit(current_candle, entry_side, entry_price, tp_pct=1.5, sl_pct=1.0, **kwargs):
     tp=tp_pct/100; sl=sl_pct/100

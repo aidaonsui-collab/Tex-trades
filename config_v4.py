@@ -36,7 +36,7 @@ POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "100"))
 # ─────────────────────────────────────────────
 # Stoch+MACD Strategy Parameters
 # ─────────────────────────────────────────────
-TP_PERCENT: float = float(os.getenv("TP_PERCENT", "1.5"))
+TP_PERCENT: float = float(os.getenv("TP_PERCENT", "2.0"))
 SL_PERCENT: float = float(os.getenv("SL_PERCENT", "1.0"))
 
 # Stochastic
@@ -105,6 +105,20 @@ def validate():
 # ─────────────────────────────────────────────
 # Composite Signal Parameters
 # ─────────────────────────────────────────────
-MIN_SCORE: float = float(os.getenv("MIN_SCORE", "4.0"))
+MIN_SCORE: float = float(os.getenv("MIN_SCORE", "3.5"))
 HTF_BONUS: float = float(os.getenv("HTF_BONUS", "0.5"))
 HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "4h")
+
+# ─────────────────────────────────────────────
+# Regime Filter (prevents catching falling knives / shorting capitulation)
+# ─────────────────────────────────────────────
+REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "8"))    # block buys if >8% below 30-bar high
+REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "5"))   # block shorts if <5% above 30-bar low
+
+# ─────────────────────────────────────────────
+# Exhaustion Blocker (prevents trading at extremes)
+# ─────────────────────────────────────────────
+EXHAUST_RSI_LOW: float = float(os.getenv("EXHAUST_RSI_LOW", "30"))   # block longs if RSI < this AND StochK < low
+EXHAUST_RSI_HIGH: float = float(os.getenv("EXHAUST_RSI_HIGH", "70")) # block shorts if RSI > this AND StochK > high
+EXHAUST_STK_LOW: float = float(os.getenv("EXHAUST_STK_LOW", "15"))   # StochK extreme low threshold
+EXHAUST_STK_HIGH: float = float(os.getenv("EXHAUST_STK_HIGH", "85")) # StochK extreme high threshold

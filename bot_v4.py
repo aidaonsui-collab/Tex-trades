@@ -423,13 +423,24 @@ def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list, candle
         macd_slow=config.MACD_SLOW,
         macd_sig_period=config.MACD_SIGNAL,
         rsi_period=config.RSI_PERIOD,
+        regime_buy_pct=config.REGIME_BUY_PCT,
+        regime_sell_pct=config.REGIME_SELL_PCT,
+        exhaust_rsi_low=config.EXHAUST_RSI_LOW,
+        exhaust_rsi_high=config.EXHAUST_RSI_HIGH,
+        exhaust_stk_low=config.EXHAUST_STK_LOW,
+        exhaust_stk_high=config.EXHAUST_STK_HIGH,
     )
 
-    logger.info("Signal=%s price=$%.2f score=%.2f gate=%d htf=%d StochK=%.1f/D=%.1f MACD=%.3f RSI=%.1f pos=%s",
+    block = result.get("block_reason", "")
+    if block:
+        logger.info("BLOCKED: %s (score=%.2f)", block, result["score"])
+
+    logger.info("Signal=%s price=$%.2f score=%.2f gate=%d htf=%d StochK=%.1f/D=%.1f MACD=%.3f RSI=%.1f dist_hi=%.1f%% dist_lo=%.1f%% pos=%s",
                 result["signal"], result["price"], result["score"],
                 result["gate_count"], result["htf_bias"],
                 result["stoch_k"], result["stoch_d"],
                 result["macd"], result["rsi"],
+                result.get("dist_from_high", 0), result.get("dist_from_low", 0),
                 state.side or "FLAT")
 
     if state.is_open():
@@ -449,14 +460,16 @@ def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list, candle
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("Stoch+MACD Bot v4 starting")
+    logger.info("Composite Bot v4.1 starting (regime + exhaustion filters)")
     logger.info("Symbol=%s  Interval=%s  Leverage=%dx  Size=$%.0f  DryRun=%s",
                 config.SYMBOL, config.CANDLE_INTERVAL, config.LEVERAGE,
                 config.POSITION_SIZE_USD, config.DRY_RUN)
-    logger.info("TP=%.1f%%  SL=%.1f%%  StochK=%d  MACD=%d/%d/%d  RSI<%d",
-                config.TP_PERCENT, config.SL_PERCENT,
-                config.STOCH_K_PERIOD, config.MACD_FAST, config.MACD_SLOW, config.MACD_SIGNAL,
-                int(config.RSI_SHORT_THRESHOLD))
+    logger.info("TP=%.1f%%  SL=%.1f%%  MinScore=%.1f  HTF_Bonus=%.1f",
+                config.TP_PERCENT, config.SL_PERCENT, config.MIN_SCORE, config.HTF_BONUS)
+    logger.info("Regime: buy_block>%.0f%% sell_block<%.0f%%  Exhaust: RSI %.0f-%.0f / K %.0f-%.0f",
+                config.REGIME_BUY_PCT, config.REGIME_SELL_PCT,
+                config.EXHAUST_RSI_LOW, config.EXHAUST_RSI_HIGH,
+                config.EXHAUST_STK_LOW, config.EXHAUST_STK_HIGH)
     logger.info("=" * 60)
 
     config.validate()
