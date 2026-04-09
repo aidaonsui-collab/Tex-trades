@@ -528,7 +528,7 @@ def main() -> None:
                     f"📈 Week: {tracker.total_trades} trades | ${tracker.total_pnl:+.2f}\n"
                     f"Loops: {loop_count} | Uptime: {uptime:.1f}h"
                 )
-                telegram._send(msg)
+                telegram._send(msg, parse_mode="")
             elif last_result:
                 # Flat — show how close we are to a signal
                 k = last_result["stoch_k"]
@@ -559,7 +559,7 @@ def main() -> None:
                     f"📈 Week: {tracker.total_trades} trades | ${tracker.total_pnl:+.2f}\n"
                     f"Loops: {loop_count} | Uptime: {uptime:.1f}h"
                 )
-                telegram._send(msg)
+                telegram._send(msg, parse_mode="")
             else:
                 telegram.send_health(loop_count, uptime)
 
