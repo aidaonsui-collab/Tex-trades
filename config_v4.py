@@ -112,8 +112,8 @@ HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "4h")
 # ─────────────────────────────────────────────
 # Regime Filter (prevents catching falling knives / shorting capitulation)
 # ─────────────────────────────────────────────
-REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "8"))    # block buys if >8% below 30-bar high
-REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "5"))   # block shorts if <5% above 30-bar low
+REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "6"))    # block buys if >6% below 30-bar high
+REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "3"))   # block shorts if <3% above 30-bar low
 
 # ─────────────────────────────────────────────
 # Exhaustion Blocker (prevents trading at extremes)
