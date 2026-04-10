@@ -15,6 +15,7 @@ Message types:
 """
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -70,24 +71,17 @@ def _bar(value: float, max_val: float = 10, length: int = 10) -> str:
 
 def send_startup() -> None:
     mode = "DRY RUN (paper trading)" if config.DRY_RUN else "LIVE TRADING"
+    tp_pct = os.environ.get("TP_PERCENT", "2.0")
+    sl_pct = os.environ.get("SL_PERCENT", "1.0")
     text = (
-        f"🚀 <b>MomBreak Bot Started</b>\n"
+        f"🚀 <b>Composite Bot v4.1 Started</b>\n"
         f"{_mode_tag()}\n\n"
-        f"<b>Strategy:</b> Momentum Breakout\n"
         f"Symbol    : <code>{_escape(config.SYMBOL)}</code>\n"
         f"Interval  : <code>{config.CANDLE_INTERVAL}</code>\n"
         f"Leverage  : <code>{config.LEVERAGE}x</code>\n"
         f"Size      : <code>${config.POSITION_SIZE_USD:.0f}</code>\n"
         f"Mode      : <code>{mode}</code>\n\n"
-        f"<b>Breakout Config:</b>\n"
-        f"Lookback  : <code>{config.BREAKOUT_LOOKBACK} bars</code>\n"
-        f"ROC thresh: <code>{config.ROC_THRESHOLD}%</code>\n"
-        f"Vol filter: <code>{config.VOLUME_MULTIPLIER}x avg</code>\n"
-        f"Trend EMA : <code>{config.TREND_EMA_PERIOD}</code>\n\n"
-        f"<b>Risk Management:</b>\n"
-        f"Stop loss : <code>ATR × {config.ATR_MULTIPLIER}</code>\n"
-        f"Take profit: <code>ATR × {config.ATR_MULTIPLIER} × {config.REWARD_RISK_RATIO}</code>\n"
-        f"R:R ratio : <code>{config.REWARD_RISK_RATIO}:1</code>"
+        f"TP: <code>{tp_pct}%</code> | SL: <code>{sl_pct}%</code>"
     )
     _send(text)
     logger.info("Telegram startup alert sent")
@@ -97,49 +91,9 @@ def send_startup() -> None:
 # Signal detected
 # ─────────────────────────────────────────────
 
-def send_signal(
-    signal: str,
-    price: float,
-    atr: float,
-    roc: float,
-    channel_high: float,
-    channel_low: float,
-    ema_trend: float,
-    volume: float,
-    volume_avg: float,
-) -> None:
-    emoji = "🟢" if signal == "LONG" else "🔴"
-    direction = "▲ BREAKOUT UP" if signal == "LONG" else "▼ BREAKDOWN"
-    trend = "BULLISH" if price > ema_trend else "BEARISH"
-
-    # Compute SL/TP levels
-    stop_dist = atr * config.ATR_MULTIPLIER
-    tp_dist = stop_dist * config.REWARD_RISK_RATIO
-    if signal == "LONG":
-        sl = price - stop_dist
-        tp = price + tp_dist
-    else:
-        sl = price + stop_dist
-        tp = price - tp_dist
-
-    vol_ratio = volume / volume_avg if volume_avg > 0 else 0
-
-    text = (
-        f"{emoji} <b>{direction}</b>  {_mode_tag()}\n\n"
-        f"Symbol  : <code>{_escape(config.SYMBOL)}</code>\n"
-        f"Price   : <code>${price:,.2f}</code>\n"
-        f"Channel : <code>${channel_low:,.2f} — ${channel_high:,.2f}</code>\n\n"
-        f"📊 <b>Indicators</b>\n"
-        f"ROC({config.BREAKOUT_LOOKBACK}): <code>{roc:+.2f}%</code>\n"
-        f"ATR(14) : <code>${atr:,.2f}</code>\n"
-        f"EMA({config.TREND_EMA_PERIOD}) : <code>${ema_trend:,.2f}</code>  ({trend})\n"
-        f"Volume  : <code>{vol_ratio:.1f}x avg</code>\n\n"
-        f"🎯 <b>Levels</b>\n"
-        f"Stop    : <code>${sl:,.2f}</code>  ({config.ATR_MULTIPLIER}x ATR)\n"
-        f"Target  : <code>${tp:,.2f}</code>  ({config.REWARD_RISK_RATIO}:1 R:R)\n"
-        f"Risk    : <code>${stop_dist:,.2f}</code>  →  Reward: <code>${tp_dist:,.2f}</code>"
-    )
-    _send(text)
+def send_signal(signal: str, price: float, *args, **kwargs) -> None:
+    """Legacy — bot_v4 uses inline telegram._send() for signal alerts."""
+    logger.debug("send_signal called (legacy no-op): %s @ $%.2f", signal, price)
 
 
 # ─────────────────────────────────────────────
@@ -157,16 +111,19 @@ def send_order_placed(
     emoji = "🟢" if signal == "LONG" else "🔴"
     prefix = "[DRY RUN] " if dry_run else ""
 
-    stop_dist = atr * config.ATR_MULTIPLIER
-    tp_dist = stop_dist * config.REWARD_RISK_RATIO
-    if signal == "LONG":
-        sl, tp = price - stop_dist, price + tp_dist
-    else:
-        sl, tp = price + stop_dist, price - tp_dist
+    tp_pct = float(os.environ.get("TP_PERCENT", "2.0"))
+    sl_pct = float(os.environ.get("SL_PERCENT", "1.0"))
 
-    # Max loss / gain estimates
-    max_loss = (stop_dist / price) * config.POSITION_SIZE_USD * leverage
-    max_gain = (tp_dist / price) * config.POSITION_SIZE_USD * leverage
+    if signal == "LONG":
+        tp = price * (1 + tp_pct / 100)
+        sl = price * (1 - sl_pct / 100)
+    else:
+        tp = price * (1 - tp_pct / 100)
+        sl = price * (1 + sl_pct / 100)
+
+    notional = size * price
+    max_loss = notional * sl_pct / 100
+    max_gain = notional * tp_pct / 100
 
     text = (
         f"{emoji} <b>{prefix}Order: {signal}</b>\n\n"
@@ -174,11 +131,11 @@ def send_order_placed(
         f"Size     : <code>{size:.4f}</code>\n"
         f"Entry    : <code>${price:,.2f}</code>\n"
         f"Leverage : <code>{leverage}x</code>\n"
-        f"Notional : <code>${size * price:,.2f}</code>\n\n"
+        f"Notional : <code>${notional:,.2f}</code>\n\n"
         f"🎯 <b>Risk Plan</b>\n"
-        f"Stop loss  : <code>${sl:,.2f}</code>  (max loss: <code>${max_loss:,.2f}</code>)\n"
-        f"Take profit: <code>${tp:,.2f}</code>  (max gain: <code>${max_gain:,.2f}</code>)\n"
-        f"R:R        : <code>{config.REWARD_RISK_RATIO}:1</code>"
+        f"Take profit: <code>${tp:,.2f}</code>  (+{tp_pct}%, gain: <code>${max_gain:,.2f}</code>)\n"
+        f"Stop loss  : <code>${sl:,.2f}</code>  (-{sl_pct}%, loss: <code>${max_loss:,.2f}</code>)\n"
+        f"R:R        : <code>{tp_pct/sl_pct:.1f}:1</code>"
     )
     _send(text)
 
@@ -257,7 +214,7 @@ def send_weekly_summary(
         f"{pnl_emoji} <b>Weekly Season Summary</b>\n"
         f"{'━' * 28}\n\n"
         f"Symbol    : <code>{_escape(config.SYMBOL)}</code>\n"
-        f"Strategy  : <code>MomBreak({config.BREAKOUT_LOOKBACK})</code>\n\n"
+        f"Strategy  : <code>Composite v4.1</code>\n\n"
         f"<b>Results:</b>\n"
         f"Trades    : <code>{total_trades}</code>  ({wins}W / {total_trades - wins}L)\n"
         f"Win rate  : <code>{wr:.0f}%</code>\n"
@@ -316,9 +273,7 @@ def send_health(
             f"\n\n📊 <b>Market</b>\n"
             f"Price   : <code>${price:,.2f}</code>  ({trend})\n"
             f"Channel : <code>${channel_low:,.2f} — ${channel_high:,.2f}</code>\n"
-            f"Dist    : <code>{dist_high:+.2f}% to high</code> / <code>{dist_low:+.2f}% to low</code>\n"
-            f"ROC({config.BREAKOUT_LOOKBACK}): <code>{roc:+.2f}%</code>\n"
-            f"ATR(14) : <code>${atr:,.2f}</code>"
+            f"Dist    : <code>{dist_high:+.2f}% to high</code> / <code>{dist_low:+.2f}% to low</code>"
         )
 
     pos_lines = ""
