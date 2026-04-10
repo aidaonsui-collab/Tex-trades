@@ -570,16 +570,26 @@ def main() -> None:
         # instead of waiting for the full hourly loop
         if state.is_open():
             check_interval = 300  # 5 minutes
-            checks_per_loop = config.LOOP_INTERVAL_SECONDS // check_interval
-            for _ in range(checks_per_loop):
-                if _shutdown_requested or not state.is_open():
+            while not _shutdown_requested and state.is_open():
+                # Check how long until next candle close (+30s buffer)
+                now = time.time()
+                secs_into_hour = now % 3600
+                secs_until_close = 3600 - secs_into_hour + 30  # 30s after the hour
+                if secs_until_close > 3600:
+                    secs_until_close -= 3600
+
+                if secs_until_close <= check_interval:
+                    # Close to candle close — wait for it and break to main loop
+                    logger.debug("Candle close in %.0fs, waiting...", secs_until_close)
+                    time.sleep(secs_until_close)
                     break
+
+                # Not close to candle close — do a price check
                 time.sleep(check_interval)
                 try:
                     price_now = _get_current_price(config.SYMBOL)
                     if price_now <= 0:
                         continue
-                    # Build a synthetic candle with current price as high/low
                     fake_candle = {"high": price_now, "low": price_now, "close": price_now,
                                    "open": price_now, "volume": 0, "timestamp": 0}
                     should_exit, reason, exit_price = strategy.check_exit(
@@ -600,7 +610,15 @@ def main() -> None:
                 except Exception as exc:
                     logger.warning("Fast price check error: %s", exc)
         else:
-            time.sleep(config.LOOP_INTERVAL_SECONDS)
+            # FLAT — sleep until 30 seconds after the next hour mark
+            now = time.time()
+            secs_into_hour = now % 3600
+            sleep_secs = 3600 - secs_into_hour + 30  # 30s after the hour
+            if sleep_secs > 3600:
+                sleep_secs -= 3600
+            logger.info("Sleeping %.0fs until next candle close (:%02d:%02d → :00:30)",
+                        sleep_secs, int(secs_into_hour // 60), int(secs_into_hour % 60))
+            time.sleep(sleep_secs)
 
     logger.info("Bot stopped after %d loops", loop_count)
 
