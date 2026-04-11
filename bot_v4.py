@@ -365,9 +365,14 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
         try:
             exchange.close_position(config.SYMBOL, snapshot["side"], snapshot["size"])
         except Exception as exc:
-            logger.error("Close failed: %s", exc)
-            telegram.send_error("close_position failed", exc)
-            return
+            err_str = str(exc)
+            if "No open position" in err_str or "REJECTED" in err_str:
+                # Native TP/SL already closed the position on Hyperliquid — this is expected
+                logger.info("Position already closed by native TP/SL (perp_modify). Recording trade.")
+            else:
+                logger.error("Close failed: %s", exc)
+                telegram.send_error("close_position failed", exc)
+                return
 
     tracker.add_trade(pnl, snapshot["side"], exit_reason)
 
