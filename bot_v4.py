@@ -25,8 +25,8 @@ import requests
 
 import sys
 import config_v4 as config
-sys.modules['config'] = config  # ensure exchange.py uses config_v4
-import exchange
+sys.modules['config'] = config
+import exchange_v2 as exchange
 import strategy_v4 as strategy
 import telegram
 
@@ -240,47 +240,14 @@ class PositionState:
 # ─────────────────────────────────────────────
 
 def fetch_candles(symbol: str, interval: str, limit: int = 100) -> list[dict]:
-    interval_ms = {"15m": 15, "30m": 30, "1h": 60, "4h": 240}
-    mins = interval_ms.get(interval, 60)
-    now = int(time.time() * 1000)
-    start = now - (limit * mins * 60 * 1000)
-
-    resp = requests.post(f"{config.HYPERLIQUID_API_URL}/info", json={
-        "type": "candleSnapshot",
-        "req": {"coin": symbol, "interval": interval, "startTime": start, "endTime": now}
-    }, timeout=15)
-    resp.raise_for_status()
-    raw = resp.json()
-
-    candles = []
-    for c in raw:
-        candles.append({
-            "timestamp": int(c["t"]),
-            "open": float(c["o"]),
-            "high": float(c["h"]),
-            "low": float(c["l"]),
-            "close": float(c["c"]),
-            "volume": float(c["v"]),
-        })
-    return candles
+    return exchange.get_candles(symbol, interval, limit)
 
 
 def _get_current_price(symbol: str) -> float:
-    """Quick price fetch using latest 1m candle."""
     try:
-        now = int(time.time() * 1000)
-        start = now - (5 * 60 * 1000)
-        resp = requests.post(f"{config.HYPERLIQUID_API_URL}/info", json={
-            "type": "candleSnapshot",
-            "req": {"coin": symbol, "interval": "1m", "startTime": start, "endTime": now}
-        }, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-        if raw:
-            return float(raw[-1]["c"])
+        return exchange.get_current_price(symbol)
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 
 # ─────────────────────────────────────────────
@@ -291,18 +258,13 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
     sig = result["signal"]
     price = result["price"]
 
-    size = strategy.calculate_size(price, config.POSITION_SIZE_USD, config.LEVERAGE)
-    if size <= 0:
-        logger.error("Zero size (price=%.2f)", price)
-        return
-
-    logger.info("Entry: %s price=$%.2f size=%.4f StochK=%.1f MACD=%.3f RSI=%.1f",
-                sig, price, size, result["stoch_k"], result["macd"], result["rsi"])
+    logger.info("Entry: %s price=$%.2f StochK=%.1f MACD=%.3f RSI=%.1f",
+                sig, price, result["stoch_k"], result["macd"], result["rsi"])
 
     tp_price = price * (1 + config.TP_PERCENT / 100) if sig == "LONG" else price * (1 - config.TP_PERCENT / 100)
     sl_price = price * (1 - config.SL_PERCENT / 100) if sig == "LONG" else price * (1 + config.SL_PERCENT / 100)
 
-    # Custom signal alert for composite strategy
+    # Telegram signal alert
     emoji = "🟢" if sig == "LONG" else "🔴"
     score = result.get("score", 0)
     gate = result.get("gate_count", 0)
@@ -323,29 +285,31 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
         f"🎯 <b>Levels</b>\n"
         f"TP: <code>${tp_price:,.2f}</code> (+{config.TP_PERCENT}%)\n"
         f"SL: <code>${sl_price:,.2f}</code> (-{config.SL_PERCENT}%)\n"
-        f"Size: <code>{size:.4f}</code> @ {config.LEVERAGE}x"
+        f"Margin: <code>${config.POSITION_SIZE_USD:.0f}</code> @ {config.LEVERAGE}x = <code>${config.POSITION_SIZE_USD * config.LEVERAGE:.0f}</code> notional"
     )
     telegram._send(msg)
 
     if not config.DRY_RUN:
         try:
-            exchange.set_leverage(config.SYMBOL, config.LEVERAGE)
-            order_side = "buy" if sig == "LONG" else "sell"
-            exchange.place_market_order(config.SYMBOL, order_side, size)
+            order_result = exchange.market_open(
+                config.SYMBOL, sig, config.POSITION_SIZE_USD, config.LEVERAGE,
+                tp_price=tp_price, sl_price=sl_price,
+            )
+            size = order_result["size"]
+            fill_price = order_result.get("price", price)
+            logger.info("Filled: %s %.4f %s @ $%.2f (notional $%.0f) TP=$%.2f SL=$%.2f",
+                        sig, size, config.SYMBOL, fill_price,
+                        order_result["notional"], tp_price, sl_price)
         except Exception as exc:
             logger.error("Order failed: %s", exc)
-            telegram.send_error("place_market_order failed", exc)
+            telegram.send_error("market_open failed", exc)
             return
+    else:
+        size = (config.POSITION_SIZE_USD * config.LEVERAGE) / price
+        fill_price = price
 
-        # Set native TP/SL on Hyperliquid via perp_modify
-        try:
-            exchange.set_tp_sl(config.SYMBOL, tp_price, sl_price)
-            logger.info("Native TP/SL set: TP=$%.2f SL=$%.2f", tp_price, sl_price)
-        except Exception as exc:
-            logger.warning("perp_modify TP/SL failed (non-fatal, using software TP/SL): %s", exc)
-
-    state.open(sig, size, price)
-    telegram.send_order_placed(sig, size, price, config.LEVERAGE, 0, dry_run=config.DRY_RUN)
+    state.open(sig, size, fill_price)
+    telegram.send_order_placed(sig, size, fill_price, config.LEVERAGE, 0, dry_run=config.DRY_RUN)
 
 
 def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
@@ -362,37 +326,41 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
                 snapshot["side"], exit_price, snapshot["entry_price"], exit_reason, pnl)
 
     if not config.DRY_RUN:
+        # Check if position is still open (native TP/SL may have already closed it)
         try:
-            exchange.close_position(config.SYMBOL, snapshot["side"], snapshot["size"])
-        except Exception as exc:
-            err_str = str(exc)
-            if "No open position" in err_str or "REJECTED" in err_str:
-                # Native TP/SL already closed the position on Hyperliquid — this is expected
-                logger.info("Position already closed by native TP/SL (perp_modify). Recording trade.")
+            open_pos = exchange.get_open_position(config.SYMBOL)
+            if open_pos and abs(open_pos["size"]) > 0.001:
+                exchange.market_close(config.SYMBOL)
+                logger.info("Position closed via market_close")
             else:
-                logger.error("Close failed: %s", exc)
-                telegram.send_error("close_position failed", exc)
-                return
+                logger.info("Position already closed by native TP/SL")
+            # Cancel any remaining trigger orders (TP/SL that didn't fire)
+            exchange.cancel_all_orders(config.SYMBOL)
+        except Exception as exc:
+            logger.warning("Close/cancel error (non-fatal): %s", exc)
 
     tracker.add_trade(pnl, snapshot["side"], exit_reason)
 
     if state._redis:
-        trade_record = {
-            "id": f"{int(time.time())}_{snapshot['side'][:1]}",
-            "symbol": config.SYMBOL,
-            "side": snapshot["side"],
-            "entry": snapshot["entry_price"],
-            "exit": exit_price,
-            "size": snapshot["size"],
-            "leverage": config.LEVERAGE,
-            "pnl": round(pnl, 4),
-            "roi": round(((exit_price - snapshot["entry_price"]) / snapshot["entry_price"] * 100)
-                         if snapshot["side"] == "LONG"
-                         else ((snapshot["entry_price"] - exit_price) / snapshot["entry_price"] * 100), 4),
-            "reason": exit_reason,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        state._redis.append_trade(trade_record)
+        try:
+            trade_record = {
+                "id": f"{int(time.time())}_{snapshot['side'][:1]}",
+                "symbol": config.SYMBOL,
+                "side": snapshot["side"],
+                "entry": snapshot["entry_price"],
+                "exit": exit_price,
+                "size": snapshot["size"],
+                "leverage": config.LEVERAGE,
+                "pnl": round(pnl, 4),
+                "roi": round(((exit_price - snapshot["entry_price"]) / snapshot["entry_price"] * 100)
+                             if snapshot["side"] == "LONG"
+                             else ((snapshot["entry_price"] - exit_price) / snapshot["entry_price"] * 100), 4),
+                "reason": exit_reason,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            state._redis.append_trade(trade_record)
+        except Exception as exc:
+            logger.warning("Redis trade record failed (non-fatal): %s", exc)
 
     telegram.send_position_closed(
         snapshot["side"], snapshot["entry_price"], exit_price, snapshot["size"], pnl,
@@ -481,6 +449,26 @@ def main() -> None:
 
     state = PositionState(config.STATE_FILE)
     tracker = WeeklyTracker()
+
+    # Sync position state from Hyperliquid (source of truth)
+    if not config.DRY_RUN:
+        try:
+            hl_pos = exchange.get_open_position(config.SYMBOL)
+            if hl_pos:
+                logger.info("Hyperliquid position found: %s %.4f @ $%.2f (uPnL $%.2f)",
+                            hl_pos["side"], hl_pos["size"], hl_pos["entry_price"], hl_pos["unrealized_pnl"])
+                if not state.is_open():
+                    state.open(hl_pos["side"], hl_pos["size"], hl_pos["entry_price"])
+                    logger.info("State synced from Hyperliquid")
+            else:
+                if state.is_open():
+                    logger.info("No Hyperliquid position but state shows open — clearing state")
+                    state.close()
+                logger.info("Position: FLAT")
+            balance = exchange.get_balance()
+            logger.info("Account balance: $%.2f", balance)
+        except Exception as exc:
+            logger.warning("Hyperliquid sync failed: %s (using local state)", exc)
 
     loop_count = 0
     start_time = time.time()
