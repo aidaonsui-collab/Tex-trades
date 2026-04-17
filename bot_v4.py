@@ -741,14 +741,19 @@ def main() -> None:
                 except Exception as exc:
                     logger.warning("Fast price check error: %s", exc)
         else:
-            # FLAT — sleep until 30 seconds after the next hour mark
+            # FLAT — sleep until 30 seconds after the next candle close
+            # For 1h: check at :00:30 of each hour
+            # For 4h: check at 00:00:30, 04:00:30, 08:00:30, 12:00:30, 16:00:30, 20:00:30 UTC
+            interval_secs = {"15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}.get(
+                config.CANDLE_INTERVAL, 3600
+            )
             now = time.time()
-            secs_into_hour = now % 3600
-            sleep_secs = 3600 - secs_into_hour + 30  # 30s after the hour
-            if sleep_secs > 3600:
-                sleep_secs -= 3600
-            logger.info("Sleeping %.0fs until next candle close (:%02d:%02d → :00:30)",
-                        sleep_secs, int(secs_into_hour // 60), int(secs_into_hour % 60))
+            secs_into_interval = now % interval_secs
+            sleep_secs = interval_secs - secs_into_interval + 30  # 30s after close
+            if sleep_secs > interval_secs:
+                sleep_secs -= interval_secs
+            logger.info("Sleeping %.0fs (%.1fh) until next %s candle close",
+                        sleep_secs, sleep_secs/3600, config.CANDLE_INTERVAL)
             time.sleep(sleep_secs)
 
     logger.info("Bot stopped after %d loops", loop_count)

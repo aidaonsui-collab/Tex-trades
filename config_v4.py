@@ -1,12 +1,13 @@
 """
-config_v4.py — Configuration for Stoch+MACD Strategy (DegenClaw)
+config_v4.py — Configuration for Composite + DCA Strategy on BTC 4h (DegenClaw)
 
-Strategy: Stochastic K/D cross + MACD trend confirmation
-  LONG:  StochK crosses above D + MACD > 0 + MACD histogram > 0
-  SHORT: StochK crosses below D + MACD < 0 + RSI < 50
-  Exit:  TP +1.5% / SL -1.2% (no leverage, no fees on DegenClaw)
+Strategy: Composite scoring + DCA + Regime filter
+  LONG:  StochK cross up + composite score ≥ 3.5 + gate ≥2/5 + regime OK
+  SHORT: StochK cross dn + composite score ≥ 3.5 + gate ≥2/5 + regime OK
+  DCA:   Layer 1 = 50% margin on initial signal; Layer 2 = 50% margin on 0.8% adverse move
+  Exit:  TP +2.5% / SL -1.5% from avg entry (native HL orders)
 
-Backtested 90 days SOL 1h: 162 trades (12.6/week), 49% WR, +21.6% ROI, PF 1.22
+Backtested 90 days BTC 4h @ 25x: 30 trades, 53% WR, +124% ROI, PF 1.49, Sortino 0.33, Max DD 27%
 """
 
 import os
@@ -28,16 +29,16 @@ HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
 # ─────────────────────────────────────────────
 # Trading Parameters
 # ─────────────────────────────────────────────
-SYMBOL: str = os.getenv("SYMBOL", "SOL")
-CANDLE_INTERVAL: str = os.getenv("CANDLE_INTERVAL", "1h")
-LEVERAGE: int = int(os.getenv("LEVERAGE", "10"))
+SYMBOL: str = os.getenv("SYMBOL", "BTC")
+CANDLE_INTERVAL: str = os.getenv("CANDLE_INTERVAL", "4h")
+LEVERAGE: int = int(os.getenv("LEVERAGE", "25"))
 POSITION_SIZE_USD: float = float(os.getenv("POSITION_SIZE_USD", "50"))
 
 # ─────────────────────────────────────────────
 # Stoch+MACD Strategy Parameters
 # ─────────────────────────────────────────────
-TP_PERCENT: float = float(os.getenv("TP_PERCENT", "2.0"))
-SL_PERCENT: float = float(os.getenv("SL_PERCENT", "1.0"))
+TP_PERCENT: float = float(os.getenv("TP_PERCENT", "2.5"))
+SL_PERCENT: float = float(os.getenv("SL_PERCENT", "1.5"))
 
 # Stochastic
 STOCH_K_PERIOD: int = int(os.getenv("STOCH_K_PERIOD", "14"))
@@ -115,20 +116,20 @@ HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "4h")
 # ─────────────────────────────────────────────
 # Regime Filter (prevents catching falling knives / shorting capitulation)
 # ─────────────────────────────────────────────
-REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "6"))    # block buys if >6% below 30-bar high
-REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "3"))   # block shorts if <3% above 30-bar low
+REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "10"))   # block buys if >10% below 30-bar high (wider for 4h)
+REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "3"))  # block shorts if <3% above 30-bar low
 
 # ─────────────────────────────────────────────
 # Exhaustion Blocker (prevents trading at extremes)
 # ─────────────────────────────────────────────
-EXHAUST_RSI_LOW: float = float(os.getenv("EXHAUST_RSI_LOW", "30"))   # block longs if RSI < this AND StochK < low
-EXHAUST_RSI_HIGH: float = float(os.getenv("EXHAUST_RSI_HIGH", "70")) # block shorts if RSI > this AND StochK > high
-EXHAUST_STK_LOW: float = float(os.getenv("EXHAUST_STK_LOW", "15"))   # StochK extreme low threshold
-EXHAUST_STK_HIGH: float = float(os.getenv("EXHAUST_STK_HIGH", "85")) # StochK extreme high threshold
+EXHAUST_RSI_LOW: float = float(os.getenv("EXHAUST_RSI_LOW", "25"))   # block longs if RSI < this AND StochK < low
+EXHAUST_RSI_HIGH: float = float(os.getenv("EXHAUST_RSI_HIGH", "75")) # block shorts if RSI > this AND StochK > high
+EXHAUST_STK_LOW: float = float(os.getenv("EXHAUST_STK_LOW", "10"))   # StochK extreme low threshold
+EXHAUST_STK_HIGH: float = float(os.getenv("EXHAUST_STK_HIGH", "90")) # StochK extreme high threshold
 
 # ─────────────────────────────────────────────
 # DCA (Dollar Cost Average) Settings
 # ─────────────────────────────────────────────
 DCA_ENABLED: bool = os.getenv("DCA_ENABLED", "true").lower() in ("true", "1", "yes")
-DCA_LAYERS: int = int(os.getenv("DCA_LAYERS", "2"))              # total layers (incl. initial)
-DCA_TRIGGER_PCT: float = float(os.getenv("DCA_TRIGGER_PCT", "0.5"))  # % adverse move to trigger next layer
+DCA_LAYERS: int = int(os.getenv("DCA_LAYERS", "2"))                # total layers (incl. initial)
+DCA_TRIGGER_PCT: float = float(os.getenv("DCA_TRIGGER_PCT", "0.8"))  # % adverse move to trigger next layer (wider for 4h)
