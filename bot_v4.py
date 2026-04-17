@@ -164,6 +164,9 @@ class PositionState:
         self.size: float = 0.0
         self.entry_price: float = 0.0
         self.entry_time: float = 0.0
+        self.initial_entry: float = 0.0  # price of layer 1 (for DCA trigger calc)
+        self.layers_filled: int = 0      # 0 = flat, 1 = layer 1 only, 2 = both layers
+        self.layer_usd: float = 0.0      # margin per layer
 
         redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
         redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
@@ -178,26 +181,44 @@ class PositionState:
     def is_open(self) -> bool:
         return self.side is not None
 
-    def open(self, side: str, size: float, price: float) -> None:
+    def open(self, side: str, size: float, price: float,
+             initial_entry: Optional[float] = None, layers_filled: int = 1,
+             layer_usd: Optional[float] = None) -> None:
         self.side = side
         self.size = size
-        self.entry_price = price
+        self.entry_price = price  # this is the AVG entry (for single layer = initial)
         self.entry_time = time.time()
+        self.initial_entry = initial_entry if initial_entry is not None else price
+        self.layers_filled = layers_filled
+        self.layer_usd = layer_usd if layer_usd is not None else config.POSITION_SIZE_USD
+        self._save()
+
+    def add_layer(self, layer_price: float, layer_size: float) -> None:
+        """Add DCA layer — recalculates avg entry price."""
+        # Weighted average entry
+        total_cost = self.entry_price * self.size + layer_price * layer_size
+        self.size = self.size + layer_size
+        self.entry_price = total_cost / self.size
+        self.layers_filled += 1
         self._save()
 
     def close(self) -> dict:
         snapshot = {"side": self.side, "size": self.size,
-                    "entry_price": self.entry_price, "entry_time": self.entry_time}
+                    "entry_price": self.entry_price, "entry_time": self.entry_time,
+                    "initial_entry": self.initial_entry, "layers_filled": self.layers_filled}
         self.side = None
         self.size = 0.0
         self.entry_price = 0.0
         self.entry_time = 0.0
+        self.initial_entry = 0.0
+        self.layers_filled = 0
         self._save()
         return snapshot
 
     def _current_data(self) -> dict:
         return {"side": self.side, "size": self.size, "entry_price": self.entry_price,
-                "entry_time": self.entry_time}
+                "entry_time": self.entry_time, "initial_entry": self.initial_entry,
+                "layers_filled": self.layers_filled, "layer_usd": self.layer_usd}
 
     def _save(self):
         data = self._current_data()
@@ -222,8 +243,13 @@ class PositionState:
             self.size = float(data.get("size", 0))
             self.entry_price = float(data.get("entry_price", 0))
             self.entry_time = float(data.get("entry_time", 0))
+            self.initial_entry = float(data.get("initial_entry", self.entry_price))
+            self.layers_filled = int(data.get("layers_filled", 1 if self.side else 0))
+            self.layer_usd = float(data.get("layer_usd", config.POSITION_SIZE_USD / 2))
             if self.side:
-                logger.info("Restored: %s %.4f @ $%.2f", self.side, self.size, self.entry_price)
+                logger.info("Restored: %s %.4f @ $%.2f (layers %d/2, init $%.2f)",
+                            self.side, self.size, self.entry_price,
+                            self.layers_filled, self.initial_entry)
 
     def _load_file(self) -> Optional[dict]:
         if not os.path.exists(self.filepath):
@@ -255,14 +281,21 @@ def _get_current_price(symbol: str) -> float:
 # ─────────────────────────────────────────────
 
 def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
+    """Enter layer 1 of DCA (50% of position size). Layer 2 added separately if price moves adverse."""
     sig = result["signal"]
     price = result["price"]
 
-    logger.info("Entry: %s price=$%.2f StochK=%.1f MACD=%.3f RSI=%.1f",
+    logger.info("Entry L1: %s price=$%.2f StochK=%.1f MACD=%.3f RSI=%.1f",
                 sig, price, result["stoch_k"], result["macd"], result["rsi"])
 
+    # Layer 1 = 50% of total margin budget
+    layer_margin = config.POSITION_SIZE_USD / config.DCA_LAYERS
+    # TP/SL from initial entry (will recalc if layer 2 fills)
     tp_price = price * (1 + config.TP_PERCENT / 100) if sig == "LONG" else price * (1 - config.TP_PERCENT / 100)
     sl_price = price * (1 - config.SL_PERCENT / 100) if sig == "LONG" else price * (1 + config.SL_PERCENT / 100)
+    # Layer 2 trigger price
+    l2_trigger = (price * (1 - config.DCA_TRIGGER_PCT / 100) if sig == "LONG"
+                  else price * (1 + config.DCA_TRIGGER_PCT / 100))
 
     # Telegram signal alert
     emoji = "🟢" if sig == "LONG" else "🔴"
@@ -273,7 +306,7 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
     star = "⭐" if score >= 4.5 else ""
 
     msg = (
-        f"{emoji} <b>{'LONG' if sig=='LONG' else 'SHORT'}</b> Signal {star} {'🟡 DRY' if config.DRY_RUN else '🔴 LIVE'}\n\n"
+        f"{emoji} <b>{'LONG' if sig=='LONG' else 'SHORT'}</b> L1 Signal {star} {'🟡 DRY' if config.DRY_RUN else '🔴 LIVE'}\n\n"
         f"Symbol: <code>{config.SYMBOL}</code>\n"
         f"Price: <code>${price:,.2f}</code>\n\n"
         f"📊 <b>Composite Score: {score:.2f}</b>\n"
@@ -282,34 +315,111 @@ def handle_entry(result, state: PositionState, tracker: WeeklyTracker) -> None:
         f"StochK: {result['stoch_k']:.1f} / D: {result['stoch_d']:.1f}\n"
         f"MACD: {result['macd']:.3f} | Hist: {result['macd_hist']:.3f}\n"
         f"RSI: {result['rsi']:.1f}\n\n"
-        f"🎯 <b>Levels</b>\n"
+        f"🎯 <b>DCA Layer 1/{config.DCA_LAYERS}</b>\n"
+        f"Margin: <code>${layer_margin:.0f}</code> @ {config.LEVERAGE}x = <code>${layer_margin * config.LEVERAGE:.0f}</code>\n"
+        f"L2 Trigger: <code>${l2_trigger:,.2f}</code> ({config.DCA_TRIGGER_PCT}% adverse)\n"
         f"TP: <code>${tp_price:,.2f}</code> (+{config.TP_PERCENT}%)\n"
-        f"SL: <code>${sl_price:,.2f}</code> (-{config.SL_PERCENT}%)\n"
-        f"Margin: <code>${config.POSITION_SIZE_USD:.0f}</code> @ {config.LEVERAGE}x = <code>${config.POSITION_SIZE_USD * config.LEVERAGE:.0f}</code> notional"
+        f"SL: <code>${sl_price:,.2f}</code> (-{config.SL_PERCENT}%)"
     )
     telegram._send(msg)
 
     if not config.DRY_RUN:
         try:
             order_result = exchange.market_open(
-                config.SYMBOL, sig, config.POSITION_SIZE_USD, config.LEVERAGE,
+                config.SYMBOL, sig, layer_margin, config.LEVERAGE,
                 tp_price=tp_price, sl_price=sl_price,
             )
             size = order_result["size"]
             fill_price = order_result.get("price", price)
-            logger.info("Filled: %s %.4f %s @ $%.2f (notional $%.0f) TP=$%.2f SL=$%.2f",
+            logger.info("Filled L1: %s %.4f %s @ $%.2f (notional $%.0f) TP=$%.2f SL=$%.2f L2@$%.2f",
                         sig, size, config.SYMBOL, fill_price,
-                        order_result["notional"], tp_price, sl_price)
+                        order_result["notional"], tp_price, sl_price, l2_trigger)
         except Exception as exc:
-            logger.error("Order failed: %s", exc)
-            telegram.send_error("market_open failed", exc)
+            logger.error("Order L1 failed: %s", exc)
+            telegram.send_error("market_open L1 failed", exc)
             return
     else:
-        size = (config.POSITION_SIZE_USD * config.LEVERAGE) / price
+        size = (layer_margin * config.LEVERAGE) / price
         fill_price = price
 
-    state.open(sig, size, fill_price)
+    state.open(sig, size, fill_price,
+               initial_entry=fill_price, layers_filled=1, layer_usd=layer_margin)
     telegram.send_order_placed(sig, size, fill_price, config.LEVERAGE, 0, dry_run=config.DRY_RUN)
+
+
+def handle_dca_layer(state: PositionState, current_price: float) -> bool:
+    """Check if price has moved adverse to trigger layer 2 entry. Returns True if filled."""
+    if state.layers_filled >= config.DCA_LAYERS:
+        return False
+    # Calculate trigger price based on initial entry
+    trigger_pct = state.layers_filled * config.DCA_TRIGGER_PCT / 100
+    if state.side == "LONG":
+        trigger_px = state.initial_entry * (1 - trigger_pct)
+        if current_price > trigger_px:
+            return False
+    else:  # SHORT
+        trigger_px = state.initial_entry * (1 + trigger_pct)
+        if current_price < trigger_px:
+            return False
+
+    # Trigger hit — add next layer
+    next_layer = state.layers_filled + 1
+    logger.info("DCA Layer %d triggered: price $%.2f %s trigger $%.2f",
+                next_layer, current_price,
+                "≤" if state.side == "LONG" else "≥", trigger_px)
+
+    if not config.DRY_RUN:
+        try:
+            order_result = exchange.market_open(
+                config.SYMBOL, state.side, state.layer_usd, config.LEVERAGE,
+                tp_price=None, sl_price=None,  # will reset TP/SL after
+            )
+            layer_size = order_result["size"]
+            fill_price = order_result.get("price", current_price)
+        except Exception as exc:
+            logger.error("L%d order failed: %s", next_layer, exc)
+            telegram.send_error(f"L{next_layer} order failed", exc)
+            return False
+    else:
+        layer_size = (state.layer_usd * config.LEVERAGE) / current_price
+        fill_price = current_price
+
+    # Update state — this recalculates avg entry
+    state.add_layer(fill_price, layer_size)
+
+    # Recalculate TP/SL from new avg entry
+    tp_price = (state.entry_price * (1 + config.TP_PERCENT / 100) if state.side == "LONG"
+                else state.entry_price * (1 - config.TP_PERCENT / 100))
+    sl_price = (state.entry_price * (1 - config.SL_PERCENT / 100) if state.side == "LONG"
+                else state.entry_price * (1 + config.SL_PERCENT / 100))
+
+    # Cancel old TP/SL and set new ones with updated size
+    if not config.DRY_RUN:
+        try:
+            exchange.cancel_all_orders(config.SYMBOL)
+            exchange._set_tp_sl_orders(config.SYMBOL, state.side == "LONG", state.size,
+                                        tp_price, sl_price)
+            logger.info("TP/SL updated: TP=$%.2f SL=$%.2f (avg $%.2f, %d layers)",
+                        tp_price, sl_price, state.entry_price, state.layers_filled)
+        except Exception as exc:
+            logger.warning("TP/SL update failed: %s", exc)
+
+    # Telegram alert
+    emoji = "🟢" if state.side == "LONG" else "🔴"
+    msg = (
+        f"{emoji} <b>DCA Layer {next_layer}/{config.DCA_LAYERS} Filled</b>\n\n"
+        f"Fill: <code>${fill_price:,.2f}</code>\n"
+        f"Layer margin: <code>${state.layer_usd:.0f}</code>\n\n"
+        f"📊 <b>New Position</b>\n"
+        f"Initial entry: <code>${state.initial_entry:,.2f}</code>\n"
+        f"Avg entry: <code>${state.entry_price:,.2f}</code>\n"
+        f"Total size: <code>{state.size:.4f}</code>\n\n"
+        f"🎯 <b>New Levels</b> (from avg)\n"
+        f"TP: <code>${tp_price:,.2f}</code>\n"
+        f"SL: <code>${sl_price:,.2f}</code>"
+    )
+    telegram._send(msg)
+    return True
 
 
 def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
@@ -347,7 +457,9 @@ def handle_exit(exit_price: float, exit_reason: str, state: PositionState,
                 "id": f"{int(time.time())}_{snapshot['side'][:1]}",
                 "symbol": config.SYMBOL,
                 "side": snapshot["side"],
-                "entry": snapshot["entry_price"],
+                "entry": snapshot["entry_price"],  # avg entry
+                "initial_entry": snapshot.get("initial_entry", snapshot["entry_price"]),
+                "layers_filled": snapshot.get("layers_filled", 1),
                 "exit": exit_price,
                 "size": snapshot["size"],
                 "leverage": config.LEVERAGE,
@@ -433,7 +545,7 @@ def run_loop(state: PositionState, tracker: WeeklyTracker, candles: list, candle
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("Composite Bot v4.1 starting (regime + exhaustion filters)")
+    logger.info("Composite Bot v4.2 starting (Composite + Regime + DCA)")
     logger.info("Symbol=%s  Interval=%s  Leverage=%dx  Size=$%.0f  DryRun=%s",
                 config.SYMBOL, config.CANDLE_INTERVAL, config.LEVERAGE,
                 config.POSITION_SIZE_USD, config.DRY_RUN)
@@ -443,6 +555,12 @@ def main() -> None:
                 config.REGIME_BUY_PCT, config.REGIME_SELL_PCT,
                 config.EXHAUST_RSI_LOW, config.EXHAUST_RSI_HIGH,
                 config.EXHAUST_STK_LOW, config.EXHAUST_STK_HIGH)
+    if config.DCA_ENABLED:
+        logger.info("DCA: %d layers, %.2f%% adverse trigger ($%.0f per layer)",
+                    config.DCA_LAYERS, config.DCA_TRIGGER_PCT,
+                    config.POSITION_SIZE_USD / config.DCA_LAYERS)
+    else:
+        logger.info("DCA: disabled (single entry)")
     logger.info("=" * 60)
 
     config.validate()
@@ -583,6 +701,13 @@ def main() -> None:
                     price_now = _get_current_price(config.SYMBOL)
                     if price_now <= 0:
                         continue
+
+                    # DCA: check if layer 2 should trigger (before checking TP/SL)
+                    if state.layers_filled < config.DCA_LAYERS:
+                        if handle_dca_layer(state, price_now):
+                            # Layer filled — continue monitoring
+                            continue
+
                     fake_candle = {"high": price_now, "low": price_now, "close": price_now,
                                    "open": price_now, "volume": 0, "timestamp": 0}
                     should_exit, reason, exit_price = strategy.check_exit(
@@ -599,7 +724,8 @@ def main() -> None:
                             upnl_pct = (price_now - ep) / ep * 100
                         else:
                             upnl_pct = (ep - price_now) / ep * 100
-                        logger.debug("Price check: $%.2f uPnL=%.2f%%", price_now, upnl_pct)
+                        logger.debug("Price check: $%.2f uPnL=%.2f%% layers=%d/%d",
+                                     price_now, upnl_pct, state.layers_filled, config.DCA_LAYERS)
                 except Exception as exc:
                     logger.warning("Fast price check error: %s", exc)
         else:
