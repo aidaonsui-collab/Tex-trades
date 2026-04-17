@@ -629,7 +629,9 @@ def main() -> None:
                     f"Symbol: {config.SYMBOL}\n"
                     f"Price: ${current_price:.2f}\n"
                     f"Position: {state.side} @ ${state.entry_price:.2f}\n"
-                    f"uPnL: {upnl:+.2f}%\n"
+                    f"Layers: {state.layers_filled}/{config.DCA_LAYERS}"
+                    + (f" (init ${state.initial_entry:.2f})" if state.layers_filled > 1 else "")
+                    + f"\nuPnL: {upnl:+.2f}% ({upnl*config.LEVERAGE:+.1f}% leveraged)\n"
                     f"TP: ${tp_price:.2f} ({dist_tp:.2f}% away)\n"
                     f"SL: ${sl_price:.2f} ({dist_sl:.2f}% away)\n\n"
                     f"📊 Indicators\n"
@@ -641,32 +643,42 @@ def main() -> None:
                 )
                 telegram._send(msg, parse_mode="")
             elif last_result:
-                # Flat — show how close we are to a signal
+                # Flat — show composite score status
                 k = last_result["stoch_k"]
                 d = last_result["stoch_d"]
                 k_above_d = k > d
                 macd = last_result["macd"]
                 hist = last_result["macd_hist"]
                 rsi_val = last_result["rsi"]
+                score = last_result.get("score", 0)
+                gate = last_result.get("gate_count", 0)
+                htf = last_result.get("htf_bias", 0)
+                dist_hi = last_result.get("dist_high", 0)
+                dist_lo = last_result.get("dist_low", 0)
 
-                long_ready = "✅" if macd > 0 and hist > 0 else "❌"
-                short_ready = "✅" if macd < 0 else "❌"
-                cross_status = "K > D (watching for cross DOWN)" if k_above_d else "K < D (watching for cross UP)"
+                htf_str = "▲▲" if htf>=2 else "▲" if htf==1 else "▼▼" if htf<=-2 else "▼" if htf==-1 else "—"
+                regime_buy_ok = dist_hi <= config.REGIME_BUY_PCT
+                regime_sell_ok = dist_lo >= config.REGIME_SELL_PCT
+                cross_status = "K > D (watching DOWN cross)" if k_above_d else "K < D (watching UP cross)"
 
                 msg = (
                     f"💓 Heartbeat {'🟡 DRY RUN' if config.DRY_RUN else '🔴 LIVE'}\n\n"
                     f"Symbol: {config.SYMBOL}\n"
                     f"Price: ${last_result['price']:.2f}\n"
                     f"Position: FLAT\n\n"
-                    f"📊 Indicators\n"
+                    f"📊 Composite Strategy\n"
+                    f"Score: {score:.2f} / {config.MIN_SCORE}\n"
+                    f"Gate: {gate}/5\n"
+                    f"4H Bias: {htf_str} ({htf:+d})\n"
+                    f"Regime: {'B✓' if regime_buy_ok else 'B✗'} {'S✓' if regime_sell_ok else 'S✗'}\n"
+                    f"Dist Hi: {dist_hi:.1f}% | Lo: {dist_lo:.1f}%\n\n"
+                    f"📈 Indicators\n"
                     f"StochK: {k:.1f} / D: {d:.1f}\n"
-                    f"Stoch: {cross_status}\n"
+                    f"{cross_status}\n"
                     f"MACD: {macd:.3f} | Hist: {hist:.3f}\n"
                     f"RSI: {rsi_val:.1f}\n\n"
-                    f"🎯 Signal readiness\n"
-                    f"{long_ready} LONG: MACD>0 & hist>0\n"
-                    f"{short_ready} SHORT: MACD<0 & RSI<50\n"
-                    f"⏳ Waiting for StochK/D cross...\n\n"
+                    f"⚙️ DCA: {config.DCA_LAYERS} layers @ {config.DCA_TRIGGER_PCT}% adverse\n"
+                    f"⏳ Waiting for StochK cross + score ≥{config.MIN_SCORE}\n\n"
                     f"📈 Week: {tracker.total_trades} trades | ${tracker.total_pnl:+.2f}\n"
                     f"Loops: {loop_count} | Uptime: {uptime:.1f}h"
                 )
