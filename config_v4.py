@@ -91,8 +91,11 @@ RETRY_MAX_DELAY: float = 60.0
 
 def validate():
     errors = []
-    if not DRY_RUN and not LITE_AGENT_API_KEY:
-        errors.append("LITE_AGENT_API_KEY required when DRY_RUN=false")
+    if not DRY_RUN:
+        if not os.getenv("HYPERLIQUID_PRIVATE_KEY", "").strip():
+            errors.append("HYPERLIQUID_PRIVATE_KEY required when DRY_RUN=false")
+        if not os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", "").strip():
+            errors.append("HYPERLIQUID_ACCOUNT_ADDRESS required when DRY_RUN=false")
     if TELEGRAM_BOT_TOKEN and not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID required with TELEGRAM_BOT_TOKEN")
     if TP_PERCENT <= 0 or TP_PERCENT > 10:
