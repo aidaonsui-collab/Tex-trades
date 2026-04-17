@@ -116,6 +116,14 @@ REGIME_BUY_PCT: float = float(os.getenv("REGIME_BUY_PCT", "6"))    # block buys 
 REGIME_SELL_PCT: float = float(os.getenv("REGIME_SELL_PCT", "3"))   # block shorts if <3% above 30-bar low
 
 # ─────────────────────────────────────────────
+# Exhaustion Blocker (prevents trading at extremes)
+# ─────────────────────────────────────────────
+EXHAUST_RSI_LOW: float = float(os.getenv("EXHAUST_RSI_LOW", "30"))   # block longs if RSI < this AND StochK < low
+EXHAUST_RSI_HIGH: float = float(os.getenv("EXHAUST_RSI_HIGH", "70")) # block shorts if RSI > this AND StochK > high
+EXHAUST_STK_LOW: float = float(os.getenv("EXHAUST_STK_LOW", "15"))   # StochK extreme low threshold
+EXHAUST_STK_HIGH: float = float(os.getenv("EXHAUST_STK_HIGH", "85")) # StochK extreme high threshold
+
+# ─────────────────────────────────────────────
 # DCA (Dollar Cost Average) Settings
 # ─────────────────────────────────────────────
 DCA_ENABLED: bool = os.getenv("DCA_ENABLED", "true").lower() in ("true", "1", "yes")
